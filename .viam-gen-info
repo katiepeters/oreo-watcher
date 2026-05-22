@@ -1,0 +1,13 @@
+{
+  "module_name": "oreo-watcher",
+  "namespace": "katie-viam",
+  "language": "python",
+  "resource_type": "component",
+  "resource_subtype": "camera",
+  "model_name": "motion-cam",
+  "enable_cloud_build": true,
+  "initialize_git": false,
+  "generator_version": "0.1.0",
+  "generated_on": "2025-10-24T21:08:17.316013Z",
+  "module_readme_link": "README.md"
+}

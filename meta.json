@@ -1,0 +1,54 @@
+{
+  "$schema": "https://dl.viam.dev/module.schema.json",
+  "module_id": "katie-viam:oreo-watcher",
+  "visibility": "private",
+  "url": "",
+  "description": "Modular components: motion-cam and filtered-mic",
+  "models": [
+    {
+      "api": "rdk:component:camera",
+      "model": "katie-viam:oreo-watcher:motion-cam",
+      "short_description": "Provide a short (100 characters or less) description of this model here",
+      "markdown_link": "README.md#model-katie-viamoreo-watchermotion-cam"
+    },
+    {
+      "api": "rdk:component:audio_in",
+      "model": "katie-viam:oreo-watcher:filtered-mic",
+      "short_description": "AudioInput that only streams audio when the level exceeds a configurable dB threshold",
+      "markdown_link": "README.md#model-katie-viamoreo-watcherfiltered-mic"
+    },
+    {
+      "api": "rdk:component:camera",
+      "model": "katie-viam:oreo-watcher:waveform-cam",
+      "short_description": "Camera that renders audio waveform images from a filtered-mic component",
+      "markdown_link": "README.md#model-katie-viamoreo-watcherwaveform-cam"
+    },
+    {
+      "api": "rdk:component:camera",
+      "model": "katie-viam:oreo-watcher:spectrogram-cam",
+      "short_description": "Camera that renders log-mel spectrogram images from a filtered-mic component",
+      "markdown_link": "README.md#model-katie-viamoreo-watcherspectrogram-cam"
+    },
+    {
+      "api": "rdk:component:sensor",
+      "model": "katie-viam:oreo-watcher:bark-monitor",
+      "short_description": "Sensor that classifies spectrograms, tracks bark sessions, and triggers speaker alerts",
+      "markdown_link": "README.md#model-katie-viamoreo-watcherbark-monitor"
+    }
+  ],
+  "applications": null,
+  "markdown_link": "README.md",
+  "entrypoint": "dist/main",
+  "first_run": "",
+  "build": {
+    "build": "./build.sh",
+    "setup": "./setup.sh",
+    "path": "dist/archive.tar.gz",
+    "arch": [
+      "linux/amd64",
+      "linux/arm64",
+      "darwin/arm64",
+      "windows/amd64"
+    ]
+  }
+}
