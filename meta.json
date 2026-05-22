@@ -2,7 +2,7 @@
   "$schema": "https://dl.viam.dev/module.schema.json",
   "module_id": "katie-viam:oreo-watcher",
   "visibility": "private",
-  "url": "",
+  "url": "https://github.com/katiepeters/oreo-watcher",
   "description": "Modular components: motion-cam and filtered-mic",
   "models": [
     {
