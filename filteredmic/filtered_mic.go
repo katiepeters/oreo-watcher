@@ -5,7 +5,9 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"os"
 	"sync"
+	"syscall"
 	"time"
 
 	"go.viam.com/rdk/components/audioin"
@@ -42,8 +44,9 @@ func init() {
 
 // Config holds the component configuration.
 type Config struct {
-	UnderlyingMic string  `json:"underlying_mic"`
-	MinDB         float64 `json:"min_db"`
+	UnderlyingMic        string  `json:"underlying_mic"`
+	MinDB                float64 `json:"min_db"`
+	MaxConsecutiveErrors int     `json:"max_consecutive_errors"` // restart viam-server after this many consecutive mic errors (default 30)
 }
 
 // Validate ensures the config is valid and returns required dependencies.
@@ -62,12 +65,14 @@ type filteredMic struct {
 	resource.AlwaysRebuild
 	resource.TriviallyCloseable
 
-	underlyingMic audioin.AudioIn
-	minDB         float64
-	logger        logging.Logger
+	underlyingMic        audioin.AudioIn
+	minDB                float64
+	maxConsecutiveErrors int
+	logger               logging.Logger
 
-	mu    sync.Mutex
-	slots map[resource.Name]*CapturedAudio
+	mu               sync.Mutex
+	slots            map[resource.Name]*CapturedAudio
+	consecutiveErrors int
 }
 
 func newFilteredMic(ctx context.Context, deps resource.Dependencies, conf resource.Config, logger logging.Logger) (audioin.AudioIn, error) {
@@ -89,13 +94,18 @@ func newFilteredMic(ctx context.Context, deps resource.Dependencies, conf resour
 	if minDB == 0 {
 		minDB = -40
 	}
+	maxErrs := cfg.MaxConsecutiveErrors
+	if maxErrs <= 0 {
+		maxErrs = 30
+	}
 
 	return &filteredMic{
-		Named:         conf.ResourceName().AsNamed(),
-		underlyingMic: mic,
-		minDB:         minDB,
-		logger:        logger,
-		slots:         make(map[resource.Name]*CapturedAudio),
+		Named:                conf.ResourceName().AsNamed(),
+		underlyingMic:        mic,
+		minDB:                minDB,
+		maxConsecutiveErrors: maxErrs,
+		logger:               logger,
+		slots:                make(map[resource.Name]*CapturedAudio),
 	}, nil
 }
 
@@ -116,10 +126,21 @@ func (f *filteredMic) GetAudio(
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		// Transient mic errors (e.g. stale buffer after restart) are expected; handled gracefully.
-		f.logger.Debugw("underlying mic GetAudio returned no audio, skipping capture", "error", err)
+		f.mu.Lock()
+		f.consecutiveErrors++
+		n := f.consecutiveErrors
+		f.mu.Unlock()
+		f.logger.Debugw("underlying mic GetAudio error", "error", err, "consecutive", n)
+		if n >= f.maxConsecutiveErrors {
+			f.logger.Errorw("mic appears stuck — restarting viam-server", "consecutive_errors", n)
+			// Signal viam-server (our parent process) to exit; viam-agent will restart it.
+			syscall.Kill(os.Getppid(), syscall.SIGTERM)
+		}
 		return nil, data.ErrNoCaptureToStore
 	}
+	f.mu.Lock()
+	f.consecutiveErrors = 0
+	f.mu.Unlock()
 
 	// Read the first chunk to check the audio level before committing to stream.
 	var firstChunk *audioin.AudioChunk
