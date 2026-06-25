@@ -25,14 +25,11 @@ import (
 	filteredmic "github.com/katie-viam/oreo-watcher/filteredmic"
 )
 
-//go:embed sounds/warning_1.wav
-var warning1SoundRaw []byte
+//go:embed sounds/leave_it.wav
+var leaveItSound []byte
 
-//go:embed sounds/warning_2.wav
-var warning2SoundRaw []byte
-
-//go:embed sounds/good_boy.wav
-var goodBoySound []byte
+//go:embed sounds/good_job.wav
+var goodJobSound []byte
 
 // Model is the model triple for the bark-monitor sensor component.
 var Model = resource.NewModel("katie-viam", "oreo-watcher", "bark-monitor")
@@ -61,6 +58,7 @@ type Config struct {
 	RecordingMic       string   `json:"recording_mic"`        // optional: raw mic for continuous session recording
 	VideoServices      []string `json:"video_services"`       // optional: video service names to clip during sessions
 	Speaker            string   `json:"speaker"`              // optional: audio_out component for playing warning sounds
+	ClipPadSeconds     float64  `json:"clip_pad_seconds"`     // seconds to include before/after session in clips (default 3)
 }
 
 // Validate ensures the config is valid and returns required dependencies.
@@ -81,8 +79,7 @@ func (c *Config) Validate(path string) ([]string, []string, error) {
 	if c.Speaker != "" {
 		required = append(required, c.Speaker)
 	}
-	required = append(required, c.VideoServices...)
-	return required, nil, nil
+	return required, c.VideoServices, nil
 }
 
 type completedSession struct {
@@ -108,10 +105,11 @@ type barkMonitor struct {
 	recordingMic     audioin.AudioIn   // raw mic for continuous session recording; nil if not configured
 	speaker          audioout.AudioOut // audio_out component for playing sounds; nil if not configured
 	videoServices    []namedVideoSvc   // video services to clip during sessions
+	clipPad          time.Duration     // extra time to include before/after session in clips
 	name             resource.Name
 	logger           logging.Logger
-	warn1Sound []byte // pre-processed pulsed warning 1, ready to pipe to aplay
-	warn2Sound []byte // pre-processed pulsed warning 2, ready to pipe to aplay
+	warn1Sound []byte
+	warn2Sound []byte
 
 	gapDur    time.Duration
 	warnDur   time.Duration
@@ -140,6 +138,10 @@ type barkMonitor struct {
 	endTimer    *time.Timer
 	warn2Timer  *time.Timer
 	actionTimer *time.Timer
+
+	// Cancel func and token for an in-progress good-job playback; nil/0 when not playing.
+	goodJobCancel context.CancelFunc
+	goodJobToken  int
 
 	// Completed session waiting to be consumed by Readings().
 	pending   *completedSession
@@ -199,11 +201,13 @@ func newBarkMonitor(ctx context.Context, deps resource.Dependencies, conf resour
 	for _, svcName := range cfg.VideoServices {
 		d, ok := deps[video.Named(svcName)]
 		if !ok {
-			return nil, fmt.Errorf("video service %q not found in dependencies", svcName)
+			logger.Warnw("video service not available, skipping", "service", svcName)
+			continue
 		}
 		svc, ok := d.(video.Service)
 		if !ok {
-			return nil, fmt.Errorf("dependency %q is not a video service", svcName)
+			logger.Warnw("dependency is not a video service, skipping", "service", svcName)
+			continue
 		}
 		videoServices = append(videoServices, namedVideoSvc{name: svcName, svc: svc})
 	}
@@ -220,14 +224,9 @@ func newBarkMonitor(ctx context.Context, deps resource.Dependencies, conf resour
 	if actionSec <= 0 {
 		actionSec = 60
 	}
-
-	pulsed1, err := pulseWAV(warning1SoundRaw, 3*time.Second, 400*time.Millisecond, 250*time.Millisecond)
-	if err != nil {
-		return nil, fmt.Errorf("processing warning 1 sound: %w", err)
-	}
-	pulsed2, err := pulseWAV(warning2SoundRaw, 3*time.Second, 400*time.Millisecond, 250*time.Millisecond)
-	if err != nil {
-		return nil, fmt.Errorf("processing warning 2 sound: %w", err)
+	clipPadSec := cfg.ClipPadSeconds
+	if clipPadSec <= 0 {
+		clipPadSec = 3
 	}
 
 	if cfg.RecordingMic != "" || len(cfg.VideoServices) > 0 {
@@ -250,11 +249,12 @@ func newBarkMonitor(ctx context.Context, deps resource.Dependencies, conf resour
 		videoServices:    videoServices,
 		name:             name,
 		logger:           logger,
-		warn1Sound:       pulsed1,
-		warn2Sound:       pulsed2,
+		warn1Sound:       leaveItSound,
+		warn2Sound:       leaveItSound,
 		gapDur:           time.Duration(float64(time.Second) * gapSec),
 		warnDur:          time.Duration(float64(time.Second) * warnSec),
 		actionDur:        time.Duration(float64(time.Second) * actionSec),
+		clipPad:          time.Duration(float64(time.Second) * clipPadSec),
 		closed:           make(chan struct{}),
 	}, nil
 }
@@ -282,10 +282,14 @@ func (b *barkMonitor) Readings(ctx context.Context, extra map[string]interface{}
 		b.logger.Debugf("classification: %s %.3f", top.Label(), top.Score())
 		if top.Label() == "bark" {
 			db := 0.0
+			var barkStart time.Time
 			if capture != nil {
 				db = capture.DB
+				if len(capture.Chunks) > 0 {
+					barkStart = chunkStartTime(capture.Chunks[0])
+				}
 			}
-			b.onBarkDetected(db)
+			b.onBarkDetected(db, barkStart)
 		}
 	}
 
@@ -321,7 +325,7 @@ func sessionReading(s *completedSession) map[string]interface{} {
 	}
 }
 
-func (b *barkMonitor) onBarkDetected(db float64) {
+func (b *barkMonitor) onBarkDetected(db float64, barkStart time.Time) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -329,7 +333,11 @@ func (b *barkMonitor) onBarkDetected(db float64) {
 
 	if !b.inSession {
 		b.inSession = true
-		b.sessionStart = now
+		if !barkStart.IsZero() {
+			b.sessionStart = barkStart
+		} else {
+			b.sessionStart = now
+		}
 		b.lastBarkTime = now
 		b.lastWarnTime = now
 		b.barkCount = 1
@@ -340,9 +348,19 @@ func (b *barkMonitor) onBarkDetected(db float64) {
 		b.classifyErrors = 0
 		b.startRecording()
 
-		b.playSound(b.warn1Sound)
-		b.warn2Timer = time.AfterFunc(b.warnDur, b.onSecondWarn)
 		b.endTimer = time.AfterFunc(b.gapDur, b.onSessionEnd)
+		if b.goodJobCancel != nil {
+			b.goodJobCancel()
+			b.goodJobCancel = nil
+		}
+		go func() {
+			b.playSound(context.Background(), b.warn1Sound)
+			b.mu.Lock()
+			defer b.mu.Unlock()
+			if b.inSession {
+				b.warn2Timer = time.AfterFunc(b.warnDur, b.onSecondWarn)
+			}
+		}()
 
 		b.logger.Infof("bark session started — warning 1 emitted")
 		return
@@ -374,11 +392,21 @@ func (b *barkMonitor) onSecondWarn() {
 	if !b.inSession {
 		return
 	}
+	if time.Since(b.lastBarkTime) > b.gapDur/2 {
+		// Oreo has been quiet long enough that the session is ending — skip warning 2.
+		return
+	}
 	b.warn2Played = true
 	b.lastWarnTime = time.Now()
 	b.logger.Infof("bark session warning 2 emitted (%.0fs elapsed)", time.Since(b.sessionStart).Seconds())
-	b.playSound(b.warn2Sound)
-	b.actionTimer = time.AfterFunc(b.actionDur, b.onThirdAction)
+	go func() {
+		b.playSound(context.Background(), b.warn2Sound)
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		if b.inSession {
+			b.actionTimer = time.AfterFunc(b.actionDur, b.onThirdAction)
+		}
+	}()
 }
 
 func (b *barkMonitor) onThirdAction() {
@@ -426,13 +454,14 @@ func (b *barkMonitor) onSessionEnd() {
 		ClassifyErrors:    b.classifyErrors,
 	}
 
-	// Stop the continuous recorder.
-	if b.recordCancel != nil {
-		b.recordCancel()
-		b.recordCancel = nil
-	}
+	// Stop the continuous recorder after clipPad seconds of post-roll.
+	cancel := b.recordCancel
+	b.recordCancel = nil
 	recordDone := b.recordDone
 	b.recordDone = nil
+	if cancel != nil {
+		time.AfterFunc(b.clipPad, cancel)
+	}
 
 	b.classifyErrors = 0
 	b.inSession = false
@@ -450,13 +479,61 @@ func (b *barkMonitor) onSessionEnd() {
 
 	// Set pending while still holding b.mu (acquired at the top of this function).
 	b.pending = session
+	var goodJobCtx context.Context
+	var goodJobCancel context.CancelFunc
+	myToken := 0
 	if playGoodBoy {
-		b.playSound(goodBoySound)
+		goodJobCtx, goodJobCancel = context.WithCancel(context.Background())
+		b.goodJobToken++
+		myToken = b.goodJobToken
+		b.goodJobCancel = goodJobCancel
 	}
 	b.mu.Unlock()
+	if playGoodBoy {
+		go func() {
+			defer func() {
+				goodJobCancel()
+				b.mu.Lock()
+				if b.goodJobToken == myToken {
+					b.goodJobCancel = nil
+				}
+				b.mu.Unlock()
+			}()
+			b.playSound(goodJobCtx, goodJobSound)
+		}()
+	}
+
+	clipStart := session.Start.Add(-b.clipPad)
+	clipEnd := session.End.Add(b.clipPad)
+	baseFilename := fmt.Sprintf("bark_%s_%ds", session.Start.Format("2006-01-02_15-04-05"), int(session.End.Sub(session.Start).Seconds()))
 
 	// Save WAV and video clips in the background — slow I/O should not block the reading.
+	// Video fetch is delayed by clipPad so that clipEnd is in the past before we request it.
 	go func() {
+		// Wait for post-roll to elapse so the full clip range is recorded before requesting.
+		time.Sleep(b.clipPad)
+
+		// Fetch video clips in parallel with the audio post-roll.
+		type videoResult struct {
+			path string
+			name string
+		}
+		videoCh := make(chan videoResult, len(b.videoServices))
+		for _, vsvc := range b.videoServices {
+			vsvc := vsvc
+			go func() {
+				tmpPath, err := b.saveVideoClip(vsvc, clipStart, clipEnd, baseFilename, "/tmp")
+				if err != nil {
+					b.logger.Warnw("failed to fetch video clip", "service", vsvc.name, "error", err)
+					videoCh <- videoResult{}
+					return
+				}
+				b.logger.Infof("video clip fetched: %s", tmpPath)
+				videoCh <- videoResult{path: tmpPath, name: vsvc.name}
+			}()
+		}
+
+		// Wait for audio post-roll to finish, then write WAV.
 		var audio []*audioin.AudioChunk
 		if recordDone != nil {
 			<-recordDone
@@ -466,17 +543,13 @@ func (b *barkMonitor) onSessionEnd() {
 			b.mu.Unlock()
 		}
 
-		baseFilename := fmt.Sprintf("bark_%s_%ds", session.Start.Format("2006-01-02_15-04-05"), int(session.End.Sub(session.Start).Seconds()))
-
 		b.logger.Infof("recorder collected %d chunks", len(audio))
 
-		// Write WAV to /tmp first so the data manager doesn't pick it up mid-write.
-		// Also compute the audio offset so muxing can align audio with the video.
 		var tmpWavPath string
 		var audioOffsetSec float64
 		if len(audio) > 0 {
-			audioOffsetSec = chunkAudioOffset(audio[0], session.Start)
-			b.logger.Infof("audio offset vs session start: %.3fs (negative = audio starts before session)", audioOffsetSec)
+			audioOffsetSec = chunkAudioOffset(audio[0], clipStart)
+			b.logger.Infof("audio offset vs clip start: %.3fs (negative = audio starts before clip)", audioOffsetSec)
 			path, err := writeSessionWAV("/tmp", session.Start, session.End, audio)
 			if err != nil {
 				b.logger.Warnw("failed to write session WAV", "error", err)
@@ -486,26 +559,22 @@ func (b *barkMonitor) onSessionEnd() {
 			}
 		}
 
-		// Fetch each video to /tmp, mux in audio, then move to sync dir.
-		for _, vsvc := range b.videoServices {
-			tmpPath, err := b.saveVideoClip(vsvc, session.Start, session.End, baseFilename, "/tmp")
-			if err != nil {
-				b.logger.Warnw("failed to fetch video clip", "service", vsvc.name, "error", err)
+		// Collect video results and mux in audio.
+		for range b.videoServices {
+			res := <-videoCh
+			if res.path == "" {
 				continue
 			}
-			b.logger.Infof("video clip fetched: %s", tmpPath)
-
 			if tmpWavPath != "" {
-				if err := muxAudioIntoVideo(tmpPath, tmpWavPath, audioOffsetSec); err != nil {
-					b.logger.Warnw("failed to mux audio into video", "service", vsvc.name, "error", err)
+				if err := muxAudioIntoVideo(res.path, tmpWavPath, audioOffsetSec); err != nil {
+					b.logger.Warnw("failed to mux audio into video", "service", res.name, "error", err)
 				} else {
-					b.logger.Infof("audio muxed into %s", tmpPath)
+					b.logger.Infof("audio muxed into %s", res.path)
 				}
 			}
-
-			finalPath := filepath.Join(b.recordingDir, filepath.Base(tmpPath))
-			if err := os.Rename(tmpPath, finalPath); err != nil {
-				b.logger.Warnw("failed to move video to sync dir", "service", vsvc.name, "error", err)
+			finalPath := filepath.Join(b.recordingDir, filepath.Base(res.path))
+			if err := os.Rename(res.path, finalPath); err != nil {
+				b.logger.Warnw("failed to move video to sync dir", "service", res.name, "error", err)
 			} else {
 				b.logger.Infof("video ready for upload: %s", finalPath)
 			}
@@ -523,8 +592,9 @@ func (b *barkMonitor) onSessionEnd() {
 	}()
 }
 
-// playSound plays WAV bytes via the configured speaker component.
-func (b *barkMonitor) playSound(wav []byte) {
+// playSound plays WAV bytes via the configured speaker component. Blocks until playback completes.
+// Must NOT be called with b.mu held — callers should launch a goroutine.
+func (b *barkMonitor) playSound(ctx context.Context, wav []byte) {
 	if len(wav) == 0 {
 		b.logger.Warnw("playSound called with empty audio data")
 		return
@@ -533,23 +603,19 @@ func (b *barkMonitor) playSound(wav []byte) {
 		b.logger.Warnw("playSound: no speaker component configured")
 		return
 	}
-	closed := b.closed
-	sp := b.speaker
-	go func() {
-		select {
-		case <-closed:
-			return
-		default:
-		}
-		pcm, info, err := wavToPCM(wav)
-		if err != nil {
-			b.logger.Warnw("failed to parse WAV for playback", "error", err)
-			return
-		}
-		if err := sp.Play(context.Background(), pcm, info, nil); err != nil {
-			b.logger.Warnw("speaker play error", "error", err)
-		}
-	}()
+	select {
+	case <-b.closed:
+		return
+	default:
+	}
+	pcm, info, err := wavToPCM(wav)
+	if err != nil {
+		b.logger.Warnw("failed to parse WAV for playback", "error", err)
+		return
+	}
+	if err := b.speaker.Play(ctx, pcm, info, nil); err != nil && ctx.Err() == nil {
+		b.logger.Warnw("speaker play error", "error", err)
+	}
 }
 
 // wavToPCM extracts raw PCM samples and audio info from a WAV byte slice.
@@ -573,19 +639,19 @@ func wavToPCM(wav []byte) ([]byte, *rutils.AudioInfo, error) {
 // DoCommand supports manual testing of sounds via the Viam control panel or API.
 // Supported commands:
 //
-//	{"command": "play_warning_1"} — play the first warning sound
-//	{"command": "play_warning_2"} — play the second warning sound
+//	{"command": "play_leave_it"} — play the warning sound
+//	{"command": "play_good_job"} — play the good boy sound
 func (b *barkMonitor) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
 	command, _ := cmd["command"].(string)
 	switch command {
-	case "play_warning_1":
-		b.playSound(b.warn1Sound)
+	case "play_leave_it":
+		go b.playSound(context.Background(), b.warn1Sound)
 		return map[string]interface{}{"ok": true}, nil
-	case "play_warning_2":
-		b.playSound(b.warn2Sound)
+	case "play_good_job":
+		go b.playSound(context.Background(), goodJobSound)
 		return map[string]interface{}{"ok": true}, nil
 	default:
-		return nil, fmt.Errorf("unknown command %q; supported: play_warning_1, play_warning_2", command)
+		return nil, fmt.Errorf("unknown command %q; supported: play_leave_it, play_good_job", command)
 	}
 }
 
@@ -617,18 +683,19 @@ func (b *barkMonitor) startRecording() {
 	b.recordCancel = cancel
 	b.recordDone = done
 	b.recordedChunks = nil
-	go b.runRecorder(ctx, done)
+	go b.runRecorder(ctx, done, b.sessionStart)
 }
 
 // runRecorder streams audio from the raw mic until ctx is cancelled, accumulating chunks under mu.
-func (b *barkMonitor) runRecorder(ctx context.Context, done chan struct{}) {
+func (b *barkMonitor) runRecorder(ctx context.Context, done chan struct{}, sessionStart time.Time) {
 	defer close(done)
 	const chunkDur = 2.0
 	var lastTimestamp int64
 outer:
 	for ctx.Err() == nil {
 		if lastTimestamp == 0 {
-			lastTimestamp = time.Now().UnixNano() - int64(chunkDur*float64(time.Second))
+			// Start from clipPad before session start to capture pre-roll audio.
+			lastTimestamp = sessionStart.Add(-b.clipPad).UnixNano() - int64(chunkDur*float64(time.Second))
 		}
 		audioChan, err := b.recordingMic.GetAudio(ctx, "pcm16", chunkDur, lastTimestamp, nil)
 		if err != nil {
@@ -646,7 +713,7 @@ outer:
 					continue outer
 				}
 				if chunk != nil {
-					lastTimestamp = chunk.EndTimestampNanoseconds - int64(200*time.Millisecond)
+					lastTimestamp = chunk.EndTimestampNanoseconds
 					b.mu.Lock()
 					b.recordedChunks = append(b.recordedChunks, chunk)
 					b.mu.Unlock()
@@ -692,12 +759,12 @@ func (b *barkMonitor) saveVideoClip(vsvc namedVideoSvc, start, end time.Time, ba
 	}
 }
 
-// chunkAudioOffset returns the offset in seconds of the first audio chunk's
-// content relative to referenceTime. Negative means the audio starts before
-// the reference (early); positive means it starts after (delayed).
-func chunkAudioOffset(c *audioin.AudioChunk, referenceTime time.Time) float64 {
+// chunkStartTime returns the wall-clock time of the first sample in the chunk,
+// derived from EndTimestampNanoseconds and the chunk's PCM frame count.
+// Returns zero time if the chunk lacks the necessary metadata.
+func chunkStartTime(c *audioin.AudioChunk) time.Time {
 	if c == nil || c.AudioInfo == nil || c.AudioInfo.SampleRateHz == 0 || len(c.AudioData) == 0 {
-		return 0
+		return time.Time{}
 	}
 	ch := int64(c.AudioInfo.NumChannels)
 	if ch == 0 {
@@ -709,11 +776,20 @@ func chunkAudioOffset(c *audioin.AudioChunk, referenceTime time.Time) float64 {
 	}
 	numFrames := int64(len(c.AudioData)) / (ch * bytesPerSample)
 	if numFrames == 0 {
-		return 0
+		return time.Time{}
 	}
 	durationNs := numFrames * int64(time.Second) / int64(c.AudioInfo.SampleRateHz)
-	audioStartNs := c.EndTimestampNanoseconds - durationNs
-	return float64(audioStartNs-referenceTime.UnixNano()) / float64(time.Second)
+	return time.Unix(0, c.EndTimestampNanoseconds-durationNs)
+}
+
+// chunkAudioOffset returns how many seconds the chunk's first sample is offset
+// from referenceTime. Negative = audio starts before reference; positive = after.
+func chunkAudioOffset(c *audioin.AudioChunk, referenceTime time.Time) float64 {
+	t := chunkStartTime(c)
+	if t.IsZero() {
+		return 0
+	}
+	return float64(t.UnixNano()-referenceTime.UnixNano()) / float64(time.Second)
 }
 
 // muxAudioIntoVideo runs ffmpeg to mix audioPath into videoPath in place.

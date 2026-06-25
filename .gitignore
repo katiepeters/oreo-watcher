@@ -169,3 +169,6 @@ reload-*/
 
 # Built binaries
 spectrogen
+
+.DS_Store
+**/.DS_Store
