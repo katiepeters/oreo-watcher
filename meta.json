@@ -34,6 +34,24 @@
       "model": "katie-viam:oreo-watcher:bark-monitor",
       "short_description": "Sensor that classifies spectrograms, tracks bark sessions, and triggers speaker alerts",
       "markdown_link": "README.md#model-katie-viamoreo-watcherbark-monitor"
+    },
+    {
+      "api": "rdk:component:sensor",
+      "model": "katie-viam:oreo-watcher:activity-monitor",
+      "short_description": "Sensor that detects whether Oreo is on his bed and tracks movement and sleep sessions",
+      "markdown_link": "README.md#model-katie-viamoreo-watcheractivity-monitor"
+    },
+    {
+      "api": "rdk:component:sensor",
+      "model": "katie-viam:oreo-watcher:movement-monitor",
+      "short_description": "Sensor that records completed movement sessions (Oreo off his bed)",
+      "markdown_link": "README.md#model-katie-viamoreo-watchermovement-monitor"
+    },
+    {
+      "api": "rdk:component:sensor",
+      "model": "katie-viam:oreo-watcher:sleep-monitor",
+      "short_description": "Sensor that records completed sleep sessions (Oreo still on his bed)",
+      "markdown_link": "README.md#model-katie-viamoreo-watchersleep-monitor"
     }
   ],
   "applications": null,
