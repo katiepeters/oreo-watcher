@@ -23,6 +23,7 @@ import (
 	rutils "go.viam.com/rdk/utils"
 
 	filteredmic "github.com/katie-viam/oreo-watcher/filteredmic"
+	modecontroller "github.com/katie-viam/oreo-watcher/modecontroller"
 )
 
 //go:embed sounds/leave_it.wav
@@ -50,6 +51,7 @@ type namedVideoSvc struct {
 // Config holds the component configuration.
 type Config struct {
 	FilteredMic        string   `json:"filtered_mic"`
+	ModeController     string   `json:"mode_controller"` // optional
 	VisionService      string   `json:"vision_service"`
 	ClassifierCamera   string   `json:"classifier_camera"`    // spectrogram-cam-classifier
 	GapSeconds         float64  `json:"gap_seconds"`          // gap without bark that ends a session (default 10)
@@ -79,6 +81,9 @@ func (c *Config) Validate(path string) ([]string, []string, error) {
 	if c.Speaker != "" {
 		required = append(required, c.Speaker)
 	}
+	if c.ModeController != "" {
+		required = append(required, c.ModeController)
+	}
 	return required, c.VideoServices, nil
 }
 
@@ -100,6 +105,7 @@ type barkMonitor struct {
 
 	audioCache       filteredmic.AudioCapture
 	visSvc           vision.Service
+	modeCtrl         modecontroller.ModeController // nil if not configured
 	classifierCamera string
 	recordingDir     string
 	recordingMic     audioin.AudioIn   // raw mic for continuous session recording; nil if not configured
@@ -197,6 +203,19 @@ func newBarkMonitor(ctx context.Context, deps resource.Dependencies, conf resour
 		}
 	}
 
+	var modeCtrl modecontroller.ModeController
+	if cfg.ModeController != "" {
+		modeDep, ok := deps[sensor.Named(cfg.ModeController)]
+		if !ok {
+			return nil, fmt.Errorf("mode_controller %q not found in dependencies", cfg.ModeController)
+		}
+		mc, ok := modeDep.(modecontroller.ModeController)
+		if !ok {
+			return nil, fmt.Errorf("dependency %q does not implement ModeController", cfg.ModeController)
+		}
+		modeCtrl = mc
+	}
+
 	var videoServices []namedVideoSvc
 	for _, svcName := range cfg.VideoServices {
 		d, ok := deps[video.Named(svcName)]
@@ -242,6 +261,7 @@ func newBarkMonitor(ctx context.Context, deps resource.Dependencies, conf resour
 		Named:            name.AsNamed(),
 		audioCache:       cache,
 		visSvc:           visSvc,
+		modeCtrl:         modeCtrl,
 		classifierCamera: cfg.ClassifierCamera,
 		recordingDir:     recordingDir,
 		recordingMic:     recordingMic,
@@ -262,6 +282,8 @@ func newBarkMonitor(ctx context.Context, deps resource.Dependencies, conf resour
 // Readings classifies the latest spectrogram, updates session state, and returns
 // a reading when a session completes.
 func (b *barkMonitor) Readings(ctx context.Context, extra map[string]interface{}) (map[string]interface{}, error) {
+	inHome := b.modeCtrl != nil && b.modeCtrl.Mode() == modecontroller.ModeHome
+
 	// Check for a completed session BEFORE calling ClassificationsFromCamera.
 	// The data manager context can expire during that slow call; if we checked
 	// pending only afterward the reading would be silently discarded.
@@ -270,6 +292,10 @@ func (b *barkMonitor) Readings(ctx context.Context, extra map[string]interface{}
 		s := b.pending
 		b.pending = nil
 		b.mu.Unlock()
+		if inHome {
+			// Discard — alerts already fired, but home mode suppresses data capture.
+			return nil, data.ErrNoCaptureToStore
+		}
 		return sessionReading(s), nil
 	}
 	b.mu.Unlock()
@@ -304,6 +330,9 @@ func (b *barkMonitor) Readings(ctx context.Context, extra map[string]interface{}
 	if b.pending != nil {
 		s := b.pending
 		b.pending = nil
+		if inHome {
+			return nil, data.ErrNoCaptureToStore
+		}
 		return sessionReading(s), nil
 	}
 

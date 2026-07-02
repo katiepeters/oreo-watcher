@@ -14,6 +14,8 @@ import (
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/services/vision"
+
+	modecontroller "github.com/katie-viam/oreo-watcher/modecontroller"
 )
 
 // Model is the model triple for the activity-monitor sensor component.
@@ -70,6 +72,7 @@ type Config struct {
 	SceneVisionService       string  `json:"scene_vision_service"`
 	Camera1                  string  `json:"camera_1"`
 	Camera2                  string  `json:"camera_2"`
+	ModeController           string  `json:"mode_controller"` // optional
 	MinBedOverlap            float64 `json:"min_bed_overlap"`
 	MaxOreoToBedSizeRatio    float64 `json:"max_oreo_to_bed_size_ratio"`
 	SleepMotionThreshold     float64 `json:"sleep_motion_threshold"`
@@ -93,7 +96,11 @@ func (c *Config) Validate(path string) ([]string, []string, error) {
 	if c.Camera2 == "" {
 		return nil, nil, fmt.Errorf("camera_2 is required")
 	}
-	return []string{c.OreoVisionService, c.SceneVisionService, c.Camera1, c.Camera2}, nil, nil
+	deps := []string{c.OreoVisionService, c.SceneVisionService, c.Camera1, c.Camera2}
+	if c.ModeController != "" {
+		deps = append(deps, c.ModeController)
+	}
+	return deps, nil, nil
 }
 
 type activityMonitor struct {
@@ -106,6 +113,7 @@ type activityMonitor struct {
 	cam2        camera.Camera
 	cam1Name    string
 	cam2Name    string
+	modeCtrl    modecontroller.ModeController // nil if not configured
 	logger      logging.Logger
 
 	minBedOverlap            float64
@@ -197,6 +205,19 @@ func newActivityMonitor(ctx context.Context, deps resource.Dependencies, conf re
 		return nil, fmt.Errorf("dependency %q is not a camera", cfg.Camera2)
 	}
 
+	var modeCtrl modecontroller.ModeController
+	if cfg.ModeController != "" {
+		modeDep, ok := deps[sensor.Named(cfg.ModeController)]
+		if !ok {
+			return nil, fmt.Errorf("mode_controller %q not found in dependencies", cfg.ModeController)
+		}
+		mc, ok := modeDep.(modecontroller.ModeController)
+		if !ok {
+			return nil, fmt.Errorf("dependency %q does not implement ModeController", cfg.ModeController)
+		}
+		modeCtrl = mc
+	}
+
 	minBedOverlap := cfg.MinBedOverlap
 	if minBedOverlap <= 0 {
 		minBedOverlap = defaultMinBedOverlap
@@ -234,6 +255,7 @@ func newActivityMonitor(ctx context.Context, deps resource.Dependencies, conf re
 		cam2:                     cam2,
 		cam1Name:                 cfg.Camera1,
 		cam2Name:                 cfg.Camera2,
+		modeCtrl:                 modeCtrl,
 		logger:                   logger,
 		minBedOverlap:            minBedOverlap,
 		maxOreoToBedSizeRatio:    maxRatio,
@@ -263,6 +285,14 @@ func (a *activityMonitor) runLoop() {
 }
 
 func (a *activityMonitor) tick(ctx context.Context) {
+	// In away_lite and home modes, camera monitoring is disabled.
+	if a.modeCtrl != nil {
+		switch a.modeCtrl.Mode() {
+		case modecontroller.ModeAwayLite, modecontroller.ModeHome:
+			return
+		}
+	}
+
 	now := time.Now()
 
 	// Check which scene caches need refreshing (brief lock, no I/O).
