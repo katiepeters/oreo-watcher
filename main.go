@@ -10,8 +10,12 @@ import (
 	"go.viam.com/rdk/module"
 	utils "go.viam.com/utils"
 
+	activitymonitor "github.com/katie-viam/oreo-watcher/activitymonitor"
 	barkmonitor "github.com/katie-viam/oreo-watcher/barkmonitor"
 	filteredmic "github.com/katie-viam/oreo-watcher/filteredmic"
+	modecontroller "github.com/katie-viam/oreo-watcher/modecontroller"
+	movementmonitor "github.com/katie-viam/oreo-watcher/movementmonitor"
+	sleepmonitor "github.com/katie-viam/oreo-watcher/sleepmonitor"
 	spectrogramcam "github.com/katie-viam/oreo-watcher/spectrogramcam"
 	waveformcam "github.com/katie-viam/oreo-watcher/waveformcam"
 )
@@ -39,6 +43,22 @@ func mainWithArgs(ctx context.Context, args []string, logger logging.Logger) err
 	}
 
 	if err = myMod.AddModelFromRegistry(ctx, sensor.API, barkmonitor.Model); err != nil {
+		return err
+	}
+
+	if err = myMod.AddModelFromRegistry(ctx, sensor.API, modecontroller.Model); err != nil {
+		return err
+	}
+
+	if err = myMod.AddModelFromRegistry(ctx, sensor.API, activitymonitor.Model); err != nil {
+		return err
+	}
+
+	if err = myMod.AddModelFromRegistry(ctx, sensor.API, movementmonitor.Model); err != nil {
+		return err
+	}
+
+	if err = myMod.AddModelFromRegistry(ctx, sensor.API, sleepmonitor.Model); err != nil {
 		return err
 	}
 
