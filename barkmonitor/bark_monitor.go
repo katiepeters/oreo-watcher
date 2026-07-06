@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	rdkapp "go.viam.com/rdk/app"
 	"go.viam.com/rdk/components/audioin"
 	"go.viam.com/rdk/components/audioout"
 	"go.viam.com/rdk/components/sensor"
@@ -23,6 +24,7 @@ import (
 	rutils "go.viam.com/rdk/utils"
 
 	filteredmic "github.com/katie-viam/oreo-watcher/filteredmic"
+	spectrogramcam "github.com/katie-viam/oreo-watcher/spectrogramcam"
 )
 
 //go:embed sounds/leave_it.wav
@@ -59,6 +61,24 @@ type Config struct {
 	VideoServices      []string `json:"video_services"`       // optional: video service names to clip during sessions
 	Speaker            string   `json:"speaker"`              // optional: audio_out component for playing warning sounds
 	ClipPadSeconds     float64  `json:"clip_pad_seconds"`     // seconds to include before/after session in clips (default 3)
+
+	// Generic bark detection
+	BarkLabel string `json:"bark_label"` // classification label to treat as a bark (default "bark")
+
+	// Dog identification (second vision model)
+	DogIDService string `json:"dog_id_service"` // optional: vision service that identifies which dog is barking
+	DogIDCamera  string `json:"dog_id_camera"`  // camera for dog ID; defaults to classifier_camera
+
+	// Custom sounds: per-dog paths take precedence over the default paths, which fall back to embedded WAVs.
+	WarningSoundPath string            `json:"warning_sound_path"`  // optional: filesystem path to default warning WAV
+	GoodJobSoundPath string            `json:"good_job_sound_path"` // optional: filesystem path to default good-job WAV
+	DogWarningSounds map[string]string `json:"dog_warning_sounds"`  // dog name → WAV path
+	DogGoodJobSounds map[string]string `json:"dog_good_job_sounds"` // dog name → WAV path
+
+	// Per-bark spectrogram upload to Viam data platform.
+	// Credentials and part ID are read from VIAM_API_KEY, VIAM_API_KEY_ID, and VIAM_MACHINE_PART_ID
+	// environment variables (set automatically by viam-server). Uploads are skipped if any are absent.
+	DatasetID string `json:"dataset_id"` // optional: add uploaded spectrograms to this dataset
 }
 
 // Validate ensures the config is valid and returns required dependencies.
@@ -79,6 +99,9 @@ func (c *Config) Validate(path string) ([]string, []string, error) {
 	if c.Speaker != "" {
 		required = append(required, c.Speaker)
 	}
+	if c.DogIDService != "" {
+		required = append(required, c.DogIDService)
+	}
 	return required, c.VideoServices, nil
 }
 
@@ -91,7 +114,8 @@ type completedSession struct {
 	Warn1Fired        bool
 	Warn2Fired        bool
 	SecsAfterLastWarn float64 // seconds from last warning to session end; small = warning was effective
-	ClassifyErrors    int    // classification failures during the session
+	ClassifyErrors    int     // classification failures during the session
+	DogName           string  // identified dog, empty if unknown or dog ID not configured
 }
 
 type barkMonitor struct {
@@ -101,6 +125,9 @@ type barkMonitor struct {
 	audioCache       filteredmic.AudioCapture
 	visSvc           vision.Service
 	classifierCamera string
+	barkLabel        string
+	dogIDSvc         vision.Service // nil if dog identification not configured
+	dogIDCamera      string
 	recordingDir     string
 	recordingMic     audioin.AudioIn   // raw mic for continuous session recording; nil if not configured
 	speaker          audioout.AudioOut // audio_out component for playing sounds; nil if not configured
@@ -108,8 +135,15 @@ type barkMonitor struct {
 	clipPad          time.Duration     // extra time to include before/after session in clips
 	name             resource.Name
 	logger           logging.Logger
-	warn1Sound []byte
-	warn2Sound []byte
+
+	// Default sounds (loaded from filesystem path or embedded fallback).
+	warn1Sound   []byte
+	warn2Sound   []byte
+	goodJobSound []byte
+
+	// Per-dog sounds; keyed by dog name returned by dogIDSvc. Falls back to defaults.
+	dogWarnSounds    map[string][]byte
+	dogGoodJobSounds map[string][]byte
 
 	gapDur    time.Duration
 	warnDur   time.Duration
@@ -128,6 +162,7 @@ type barkMonitor struct {
 	warn1Played    bool
 	warn2Played    bool
 	classifyErrors int
+	sessionDogName string // set on first bark of the session; "" if unknown
 
 	// Continuous recording state (nil when not in a session).
 	recordCancel   context.CancelFunc
@@ -143,10 +178,28 @@ type barkMonitor struct {
 	goodJobCancel context.CancelFunc
 	goodJobToken  int
 
+	// Per-bark spectrogram upload (nil when not configured).
+	viamClient  *rdkapp.ViamClient
+	dataClient  *rdkapp.DataClient
+	viamPartID  string
+	datasetID   string
+
 	// Completed session waiting to be consumed by Readings().
 	pending   *completedSession
 	closed    chan struct{}
 	closeOnce sync.Once
+}
+
+// loadSound returns the WAV bytes at path, or falls back to fallback if path is empty.
+func loadSound(path string, fallback []byte) ([]byte, error) {
+	if path == "" {
+		return fallback, nil
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("loading sound %q: %w", path, err)
+	}
+	return b, nil
 }
 
 func newBarkMonitor(ctx context.Context, deps resource.Dependencies, conf resource.Config, logger logging.Logger) (sensor.Sensor, error) {
@@ -171,6 +224,22 @@ func newBarkMonitor(ctx context.Context, deps resource.Dependencies, conf resour
 	visSvc, ok := depRaw.(vision.Service)
 	if !ok {
 		return nil, fmt.Errorf("dependency %q is not a vision service", cfg.VisionService)
+	}
+
+	var dogIDSvc vision.Service
+	if cfg.DogIDService != "" {
+		d, ok := deps[vision.Named(cfg.DogIDService)]
+		if !ok {
+			return nil, fmt.Errorf("dog_id_service %q not found in dependencies", cfg.DogIDService)
+		}
+		dogIDSvc, ok = d.(vision.Service)
+		if !ok {
+			return nil, fmt.Errorf("dependency %q is not a vision service", cfg.DogIDService)
+		}
+	}
+	dogIDCamera := cfg.DogIDCamera
+	if dogIDCamera == "" {
+		dogIDCamera = cfg.ClassifierCamera
 	}
 
 	var recordingMic audioin.AudioIn
@@ -212,6 +281,37 @@ func newBarkMonitor(ctx context.Context, deps resource.Dependencies, conf resour
 		videoServices = append(videoServices, namedVideoSvc{name: svcName, svc: svc})
 	}
 
+	warn1Snd, err := loadSound(cfg.WarningSoundPath, leaveItSound)
+	if err != nil {
+		return nil, err
+	}
+	goodJobSnd, err := loadSound(cfg.GoodJobSoundPath, goodJobSound)
+	if err != nil {
+		return nil, err
+	}
+
+	dogWarnSounds := make(map[string][]byte, len(cfg.DogWarningSounds))
+	for dog, path := range cfg.DogWarningSounds {
+		snd, err := loadSound(path, nil)
+		if err != nil {
+			return nil, fmt.Errorf("dog_warning_sounds[%q]: %w", dog, err)
+		}
+		dogWarnSounds[dog] = snd
+	}
+	dogGoodJobSounds := make(map[string][]byte, len(cfg.DogGoodJobSounds))
+	for dog, path := range cfg.DogGoodJobSounds {
+		snd, err := loadSound(path, nil)
+		if err != nil {
+			return nil, fmt.Errorf("dog_good_job_sounds[%q]: %w", dog, err)
+		}
+		dogGoodJobSounds[dog] = snd
+	}
+
+	barkLabel := cfg.BarkLabel
+	if barkLabel == "" {
+		barkLabel = "bark"
+	}
+
 	gapSec := cfg.GapSeconds
 	if gapSec <= 0 {
 		gapSec = 10
@@ -235,6 +335,23 @@ func newBarkMonitor(ctx context.Context, deps resource.Dependencies, conf resour
 		}
 	}
 
+	apiKey := os.Getenv(rutils.APIKeyEnvVar)
+	apiKeyID := os.Getenv(rutils.APIKeyIDEnvVar)
+	partID := os.Getenv(rutils.MachinePartIDEnvVar)
+
+	var viamClient *rdkapp.ViamClient
+	var dataClient *rdkapp.DataClient
+	if apiKey != "" && apiKeyID != "" && partID != "" {
+		vc, err := rdkapp.CreateViamClientWithAPIKey(ctx, rdkapp.Options{}, apiKey, apiKeyID, logger)
+		if err != nil {
+			return nil, fmt.Errorf("connecting to Viam for bark uploads: %w", err)
+		}
+		viamClient = vc
+		dataClient = vc.DataClient()
+	} else {
+		logger.Infow("per-bark spectrogram upload disabled: VIAM_API_KEY, VIAM_API_KEY_ID, or VIAM_MACHINE_PART_ID not set")
+	}
+
 	name := conf.ResourceName()
 	cache.RegisterConsumer(name)
 
@@ -243,14 +360,24 @@ func newBarkMonitor(ctx context.Context, deps resource.Dependencies, conf resour
 		audioCache:       cache,
 		visSvc:           visSvc,
 		classifierCamera: cfg.ClassifierCamera,
+		barkLabel:        barkLabel,
+		dogIDSvc:         dogIDSvc,
+		dogIDCamera:      dogIDCamera,
 		recordingDir:     recordingDir,
 		recordingMic:     recordingMic,
 		speaker:          speaker,
 		videoServices:    videoServices,
 		name:             name,
 		logger:           logger,
-		warn1Sound:       leaveItSound,
-		warn2Sound:       leaveItSound,
+		warn1Sound:       warn1Snd,
+		warn2Sound:       warn1Snd,
+		goodJobSound:     goodJobSnd,
+		dogWarnSounds:    dogWarnSounds,
+		dogGoodJobSounds: dogGoodJobSounds,
+		viamClient:       viamClient,
+		dataClient:       dataClient,
+		viamPartID:       partID,
+		datasetID:        cfg.DatasetID,
 		gapDur:           time.Duration(float64(time.Second) * gapSec),
 		warnDur:          time.Duration(float64(time.Second) * warnSec),
 		actionDur:        time.Duration(float64(time.Second) * actionSec),
@@ -280,7 +407,7 @@ func (b *barkMonitor) Readings(ctx context.Context, extra map[string]interface{}
 	if classifyErr == nil && len(classifications) > 0 {
 		top := classifications[0]
 		b.logger.Debugf("classification: %s %.3f", top.Label(), top.Score())
-		if top.Label() == "bark" {
+		if top.Label() == b.barkLabel {
 			db := 0.0
 			var barkStart time.Time
 			if capture != nil {
@@ -289,7 +416,31 @@ func (b *barkMonitor) Readings(ctx context.Context, extra map[string]interface{}
 					barkStart = chunkStartTime(capture.Chunks[0])
 				}
 			}
-			b.onBarkDetected(db, barkStart)
+
+			// Identify which dog is barking, but only on the first bark of a new session.
+			dogName := ""
+			if b.dogIDSvc != nil {
+				b.mu.Lock()
+				alreadyIdentified := b.inSession && b.sessionDogName != ""
+				b.mu.Unlock()
+				if !alreadyIdentified {
+					dogClasses, err := b.dogIDSvc.ClassificationsFromCamera(ctx, b.dogIDCamera, 1, nil)
+					if err != nil {
+						b.logger.Warnw("dog ID classification failed", "error", err)
+					} else if len(dogClasses) > 0 {
+						dogName = dogClasses[0].Label()
+						b.logger.Debugf("dog ID: %s %.3f", dogName, dogClasses[0].Score())
+					}
+				}
+			}
+
+			b.onBarkDetected(db, barkStart, dogName)
+
+			if b.dataClient != nil && capture != nil && len(capture.Chunks) > 0 {
+				chunks := capture.Chunks
+				captureDB := capture.DB
+				go b.uploadBarkSpectrogram(chunks, captureDB, dogName)
+			}
 		}
 	}
 
@@ -322,10 +473,31 @@ func sessionReading(s *completedSession) map[string]interface{} {
 		"warn2_fired":          s.Warn2Fired,
 		"secs_after_last_warn": math.Round(s.SecsAfterLastWarn*10) / 10,
 		"classify_errors":      s.ClassifyErrors,
+		"dog_name":             s.DogName,
 	}
 }
 
-func (b *barkMonitor) onBarkDetected(db float64, barkStart time.Time) {
+// warnSoundFor returns the warning WAV for dogName, falling back to the default.
+func (b *barkMonitor) warnSoundFor(dogName string) []byte {
+	if dogName != "" {
+		if snd, ok := b.dogWarnSounds[dogName]; ok {
+			return snd
+		}
+	}
+	return b.warn1Sound
+}
+
+// goodJobSoundFor returns the good-job WAV for dogName, falling back to the default.
+func (b *barkMonitor) goodJobSoundFor(dogName string) []byte {
+	if dogName != "" {
+		if snd, ok := b.dogGoodJobSounds[dogName]; ok {
+			return snd
+		}
+	}
+	return b.goodJobSound
+}
+
+func (b *barkMonitor) onBarkDetected(db float64, barkStart time.Time, dogName string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -346,6 +518,7 @@ func (b *barkMonitor) onBarkDetected(db float64, barkStart time.Time) {
 		b.warn1Played = true
 		b.warn2Played = false
 		b.classifyErrors = 0
+		b.sessionDogName = dogName
 		b.startRecording()
 
 		b.endTimer = time.AfterFunc(b.gapDur, b.onSessionEnd)
@@ -353,8 +526,9 @@ func (b *barkMonitor) onBarkDetected(db float64, barkStart time.Time) {
 			b.goodJobCancel()
 			b.goodJobCancel = nil
 		}
+		warnSnd := b.warnSoundFor(dogName)
 		go func() {
-			b.playSound(context.Background(), b.warn1Sound)
+			b.playSound(context.Background(), warnSnd)
 			b.mu.Lock()
 			defer b.mu.Unlock()
 			if b.inSession {
@@ -362,7 +536,7 @@ func (b *barkMonitor) onBarkDetected(db float64, barkStart time.Time) {
 			}
 		}()
 
-		b.logger.Infof("bark session started — warning 1 emitted")
+		b.logger.Infof("bark session started (dog=%q) — warning 1 emitted", dogName)
 		return
 	}
 
@@ -399,8 +573,9 @@ func (b *barkMonitor) onSecondWarn() {
 	b.warn2Played = true
 	b.lastWarnTime = time.Now()
 	b.logger.Infof("bark session warning 2 emitted (%.0fs elapsed)", time.Since(b.sessionStart).Seconds())
+	warnSnd := b.warnSoundFor(b.sessionDogName)
 	go func() {
-		b.playSound(context.Background(), b.warn2Sound)
+		b.playSound(context.Background(), warnSnd)
 		b.mu.Lock()
 		defer b.mu.Unlock()
 		if b.inSession {
@@ -442,6 +617,7 @@ func (b *barkMonitor) onSessionEnd() {
 	}
 
 	endTime := time.Now()
+	dogName := b.sessionDogName
 	session := &completedSession{
 		Start:             b.sessionStart,
 		End:               endTime,
@@ -452,6 +628,7 @@ func (b *barkMonitor) onSessionEnd() {
 		Warn2Fired:        b.warn2Played,
 		SecsAfterLastWarn: endTime.Sub(b.lastWarnTime).Seconds(),
 		ClassifyErrors:    b.classifyErrors,
+		DogName:           dogName,
 	}
 
 	// Stop the continuous recorder after clipPad seconds of post-roll.
@@ -465,6 +642,7 @@ func (b *barkMonitor) onSessionEnd() {
 
 	b.classifyErrors = 0
 	b.inSession = false
+	b.sessionDogName = ""
 	playGoodBoy := b.warn1Played
 
 	if b.warn2Timer != nil {
@@ -474,8 +652,8 @@ func (b *barkMonitor) onSessionEnd() {
 		b.actionTimer.Stop()
 	}
 
-	b.logger.Infof("bark session ended: duration=%.1fs barks=%d warn2=%v secs_after_warn=%.1f",
-		endTime.Sub(b.sessionStart).Seconds(), b.barkCount, b.warn2Played, session.SecsAfterLastWarn)
+	b.logger.Infof("bark session ended: dog=%q duration=%.1fs barks=%d warn2=%v secs_after_warn=%.1f",
+		dogName, endTime.Sub(b.sessionStart).Seconds(), b.barkCount, b.warn2Played, session.SecsAfterLastWarn)
 
 	// Set pending while still holding b.mu (acquired at the top of this function).
 	b.pending = session
@@ -488,6 +666,7 @@ func (b *barkMonitor) onSessionEnd() {
 		myToken = b.goodJobToken
 		b.goodJobCancel = goodJobCancel
 	}
+	goodJobSnd := b.goodJobSoundFor(dogName)
 	b.mu.Unlock()
 	if playGoodBoy {
 		go func() {
@@ -499,13 +678,17 @@ func (b *barkMonitor) onSessionEnd() {
 				}
 				b.mu.Unlock()
 			}()
-			b.playSound(goodJobCtx, goodJobSound)
+			b.playSound(goodJobCtx, goodJobSnd)
 		}()
 	}
 
 	clipStart := session.Start.Add(-b.clipPad)
 	clipEnd := session.End.Add(b.clipPad)
-	baseFilename := fmt.Sprintf("bark_%s_%ds", session.Start.Format("2006-01-02_15-04-05"), int(session.End.Sub(session.Start).Seconds()))
+	dogTag := dogName
+	if dogTag == "" {
+		dogTag = "unknown"
+	}
+	baseFilename := fmt.Sprintf("bark_%s_%s_%ds", session.Start.Format("2006-01-02_15-04-05"), dogTag, int(session.End.Sub(session.Start).Seconds()))
 
 	// Save WAV and video clips in the background — slow I/O should not block the reading.
 	// Video fetch is delayed by clipPad so that clipEnd is in the past before we request it.
@@ -618,6 +801,58 @@ func (b *barkMonitor) playSound(ctx context.Context, wav []byte) {
 	}
 }
 
+// uploadBarkSpectrogram renders a spectrogram PNG from chunks and uploads it to
+// the Viam data platform with a candidate label for the identified dog.
+// Must NOT be called with b.mu held — intended to run in a goroutine.
+func (b *barkMonitor) uploadBarkSpectrogram(chunks []*audioin.AudioChunk, db float64, dogName string) {
+	if len(chunks) == 0 || chunks[0].AudioInfo == nil {
+		return
+	}
+	sampleRate := int(chunks[0].AudioInfo.SampleRateHz)
+	if sampleRate == 0 {
+		sampleRate = 44100
+	}
+
+	startNs := chunkStartTime(chunks[0]).UnixNano()
+	endNs := chunks[len(chunks)-1].EndTimestampNanoseconds
+	capturedAt := time.Unix(0, endNs)
+
+	png, err := spectrogramcam.RenderChunks(chunks, sampleRate, capturedAt, startNs, endNs, db)
+	if err != nil {
+		b.logger.Warnw("failed to render bark spectrogram for upload", "error", err)
+		return
+	}
+
+	tag := "unknown-bark-candidate"
+	if dogName != "" {
+		tag = dogName + "-bark-candidate"
+	}
+
+	opts := &rdkapp.BinaryDataCaptureUploadOptions{
+		Tags:             []string{tag},
+		DataRequestTimes: &[2]time.Time{time.Unix(0, startNs), capturedAt},
+	}
+	if b.datasetID != "" {
+		opts.DatasetIDs = []string{b.datasetID}
+	}
+
+	id, err := b.dataClient.BinaryDataCaptureUpload(
+		context.Background(),
+		png,
+		b.viamPartID,
+		"camera",
+		b.classifierCamera,
+		"GetImages",
+		".png",
+		opts,
+	)
+	if err != nil {
+		b.logger.Warnw("failed to upload bark spectrogram", "error", err)
+		return
+	}
+	b.logger.Debugf("bark spectrogram uploaded: %s (tag=%s)", id, tag)
+}
+
 // wavToPCM extracts raw PCM samples and audio info from a WAV byte slice.
 func wavToPCM(wav []byte) ([]byte, *rutils.AudioInfo, error) {
 	if len(wav) < 36 {
@@ -648,7 +883,7 @@ func (b *barkMonitor) DoCommand(ctx context.Context, cmd map[string]interface{})
 		go b.playSound(context.Background(), b.warn1Sound)
 		return map[string]interface{}{"ok": true}, nil
 	case "play_good_job":
-		go b.playSound(context.Background(), goodJobSound)
+		go b.playSound(context.Background(), b.goodJobSound)
 		return map[string]interface{}{"ok": true}, nil
 	default:
 		return nil, fmt.Errorf("unknown command %q; supported: play_leave_it, play_good_job", command)
@@ -668,6 +903,9 @@ func (b *barkMonitor) Close(ctx context.Context) error {
 	if b.recordCancel != nil {
 		b.recordCancel()
 		b.recordCancel = nil
+	}
+	if b.viamClient != nil {
+		b.viamClient.Close()
 	}
 	return nil
 }
