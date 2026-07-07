@@ -118,11 +118,11 @@ type barkMonitor struct {
 	mu sync.Mutex
 
 	// Active session state.
-	inSession      bool
-	sessionStart   time.Time
-	lastBarkTime   time.Time
-	lastWarnTime   time.Time
-	minDB          float64
+	inSession    bool
+	sessionStart time.Time
+	lastBarkTime time.Time
+	lastWarnTime time.Time
+	minDB        float64
 	maxDB          float64
 	barkCount      int
 	warn1Played    bool
@@ -436,7 +436,7 @@ func (b *barkMonitor) onSessionEnd() {
 		b.mu.Unlock()
 		return
 	}
-	if time.Since(b.lastBarkTime) < b.gapDur/2 {
+	if time.Since(b.lastBarkTime) < b.gapDur {
 		b.mu.Unlock()
 		return
 	}
