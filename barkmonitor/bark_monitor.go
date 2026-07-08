@@ -118,11 +118,11 @@ type barkMonitor struct {
 	mu sync.Mutex
 
 	// Active session state.
-	inSession      bool
-	sessionStart   time.Time
-	lastBarkTime   time.Time
-	lastWarnTime   time.Time
-	minDB          float64
+	inSession    bool
+	sessionStart time.Time
+	lastBarkTime time.Time
+	lastWarnTime time.Time
+	minDB        float64
 	maxDB          float64
 	barkCount      int
 	warn1Played    bool
@@ -135,9 +135,10 @@ type barkMonitor struct {
 	recordedChunks []*audioin.AudioChunk
 
 	// Timers (all stopped/replaced under mu).
-	endTimer    *time.Timer
-	warn2Timer  *time.Timer
-	actionTimer *time.Timer
+	endTimer     *time.Timer
+	warn2Timer   *time.Timer
+	actionTimer  *time.Timer
+	goodJobTimer *time.Timer // fires at gapDur after last bark to play the good-job sound
 
 	// Cancel func and token for an in-progress good-job playback; nil/0 when not playing.
 	goodJobCancel context.CancelFunc
@@ -348,7 +349,11 @@ func (b *barkMonitor) onBarkDetected(db float64, barkStart time.Time) {
 		b.classifyErrors = 0
 		b.startRecording()
 
-		b.endTimer = time.AfterFunc(b.gapDur, b.onSessionEnd)
+		b.endTimer = time.AfterFunc(b.gapDur/2, b.onSessionEnd)
+		if b.goodJobTimer != nil {
+			b.goodJobTimer.Stop()
+			b.goodJobTimer = nil
+		}
 		if b.goodJobCancel != nil {
 			b.goodJobCancel()
 			b.goodJobCancel = nil
@@ -441,7 +446,7 @@ func (b *barkMonitor) onSessionEnd() {
 		return
 	}
 
-	endTime := time.Now()
+	endTime := b.lastBarkTime.Add(b.gapDur / 2)
 	session := &completedSession{
 		Start:             b.sessionStart,
 		End:               endTime,
@@ -465,7 +470,7 @@ func (b *barkMonitor) onSessionEnd() {
 
 	b.classifyErrors = 0
 	b.inSession = false
-	playGoodBoy := b.warn1Played
+	scheduleGoodJob := b.warn1Played
 
 	if b.warn2Timer != nil {
 		b.warn2Timer.Stop()
@@ -479,29 +484,13 @@ func (b *barkMonitor) onSessionEnd() {
 
 	// Set pending while still holding b.mu (acquired at the top of this function).
 	b.pending = session
-	var goodJobCtx context.Context
-	var goodJobCancel context.CancelFunc
-	myToken := 0
-	if playGoodBoy {
-		goodJobCtx, goodJobCancel = context.WithCancel(context.Background())
-		b.goodJobToken++
-		myToken = b.goodJobToken
-		b.goodJobCancel = goodJobCancel
+	if scheduleGoodJob {
+		if b.goodJobTimer != nil {
+			b.goodJobTimer.Stop()
+		}
+		b.goodJobTimer = time.AfterFunc(b.gapDur/2, b.onGoodJob)
 	}
 	b.mu.Unlock()
-	if playGoodBoy {
-		go func() {
-			defer func() {
-				goodJobCancel()
-				b.mu.Lock()
-				if b.goodJobToken == myToken {
-					b.goodJobCancel = nil
-				}
-				b.mu.Unlock()
-			}()
-			b.playSound(goodJobCtx, goodJobSound)
-		}()
-	}
 
 	clipStart := session.Start.Add(-b.clipPad)
 	clipEnd := session.End.Add(b.clipPad)
@@ -592,6 +581,38 @@ func (b *barkMonitor) onSessionEnd() {
 	}()
 }
 
+// onGoodJob fires gapDur after the last bark. It plays the good-job sound confirming the dog
+// stopped barking for a full gap period. Cancelled (goodJobTimer stopped) if barking resumes.
+func (b *barkMonitor) onGoodJob() {
+	select {
+	case <-b.closed:
+		return
+	default:
+	}
+	b.mu.Lock()
+	if b.inSession {
+		b.mu.Unlock()
+		return
+	}
+	goodJobCtx, goodJobCancel := context.WithCancel(context.Background())
+	b.goodJobToken++
+	myToken := b.goodJobToken
+	b.goodJobCancel = goodJobCancel
+	b.mu.Unlock()
+
+	go func() {
+		defer func() {
+			goodJobCancel()
+			b.mu.Lock()
+			if b.goodJobToken == myToken {
+				b.goodJobCancel = nil
+			}
+			b.mu.Unlock()
+		}()
+		b.playSound(goodJobCtx, goodJobSound)
+	}()
+}
+
 // playSound plays WAV bytes via the configured speaker component. Blocks until playback completes.
 // Must NOT be called with b.mu held — callers should launch a goroutine.
 func (b *barkMonitor) playSound(ctx context.Context, wav []byte) {
@@ -660,7 +681,7 @@ func (b *barkMonitor) Close(ctx context.Context) error {
 	b.closeOnce.Do(func() { close(b.closed) })
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	for _, t := range []*time.Timer{b.endTimer, b.warn2Timer, b.actionTimer} {
+	for _, t := range []*time.Timer{b.endTimer, b.warn2Timer, b.actionTimer, b.goodJobTimer} {
 		if t != nil {
 			t.Stop()
 		}
