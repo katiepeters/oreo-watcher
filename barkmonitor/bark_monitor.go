@@ -170,19 +170,21 @@ type barkMonitor struct {
 	recordedChunks []*audioin.AudioChunk
 
 	// Timers (all stopped/replaced under mu).
-	endTimer    *time.Timer
-	warn2Timer  *time.Timer
-	actionTimer *time.Timer
+	endTimer     *time.Timer
+	warn2Timer   *time.Timer
+	actionTimer  *time.Timer
+	goodJobTimer *time.Timer // fires at gapDur after last bark to play the good-job sound
 
 	// Cancel func and token for an in-progress good-job playback; nil/0 when not playing.
-	goodJobCancel context.CancelFunc
-	goodJobToken  int
+	goodJobCancel  context.CancelFunc
+	goodJobToken   int
+	goodJobDogName string // dog for the pending/playing good-job sound, set when goodJobTimer is scheduled
 
 	// Per-bark spectrogram upload (nil when not configured).
-	viamClient  *rdkapp.ViamClient
-	dataClient  *rdkapp.DataClient
-	viamPartID  string
-	datasetID   string
+	viamClient *rdkapp.ViamClient
+	dataClient *rdkapp.DataClient
+	viamPartID string
+	datasetID  string
 
 	// Completed session waiting to be consumed by Readings().
 	pending   *completedSession
@@ -521,7 +523,11 @@ func (b *barkMonitor) onBarkDetected(db float64, barkStart time.Time, dogName st
 		b.sessionDogName = dogName
 		b.startRecording()
 
-		b.endTimer = time.AfterFunc(b.gapDur, b.onSessionEnd)
+		b.endTimer = time.AfterFunc(b.gapDur/2, b.onSessionEnd)
+		if b.goodJobTimer != nil {
+			b.goodJobTimer.Stop()
+			b.goodJobTimer = nil
+		}
 		if b.goodJobCancel != nil {
 			b.goodJobCancel()
 			b.goodJobCancel = nil
@@ -616,7 +622,7 @@ func (b *barkMonitor) onSessionEnd() {
 		return
 	}
 
-	endTime := time.Now()
+	endTime := b.lastBarkTime.Add(b.gapDur / 2)
 	dogName := b.sessionDogName
 	session := &completedSession{
 		Start:             b.sessionStart,
@@ -643,7 +649,7 @@ func (b *barkMonitor) onSessionEnd() {
 	b.classifyErrors = 0
 	b.inSession = false
 	b.sessionDogName = ""
-	playGoodBoy := b.warn1Played
+	scheduleGoodJob := b.warn1Played
 
 	if b.warn2Timer != nil {
 		b.warn2Timer.Stop()
@@ -657,30 +663,14 @@ func (b *barkMonitor) onSessionEnd() {
 
 	// Set pending while still holding b.mu (acquired at the top of this function).
 	b.pending = session
-	var goodJobCtx context.Context
-	var goodJobCancel context.CancelFunc
-	myToken := 0
-	if playGoodBoy {
-		goodJobCtx, goodJobCancel = context.WithCancel(context.Background())
-		b.goodJobToken++
-		myToken = b.goodJobToken
-		b.goodJobCancel = goodJobCancel
+	if scheduleGoodJob {
+		b.goodJobDogName = dogName
+		if b.goodJobTimer != nil {
+			b.goodJobTimer.Stop()
+		}
+		b.goodJobTimer = time.AfterFunc(b.gapDur/2, b.onGoodJob)
 	}
-	goodJobSnd := b.goodJobSoundFor(dogName)
 	b.mu.Unlock()
-	if playGoodBoy {
-		go func() {
-			defer func() {
-				goodJobCancel()
-				b.mu.Lock()
-				if b.goodJobToken == myToken {
-					b.goodJobCancel = nil
-				}
-				b.mu.Unlock()
-			}()
-			b.playSound(goodJobCtx, goodJobSnd)
-		}()
-	}
 
 	clipStart := session.Start.Add(-b.clipPad)
 	clipEnd := session.End.Add(b.clipPad)
@@ -772,6 +762,39 @@ func (b *barkMonitor) onSessionEnd() {
 				b.logger.Infof("WAV ready for upload: %s", finalPath)
 			}
 		}
+	}()
+}
+
+// onGoodJob fires gapDur after the last bark. It plays the good-job sound confirming the dog
+// stopped barking for a full gap period. Cancelled (goodJobTimer stopped) if barking resumes.
+func (b *barkMonitor) onGoodJob() {
+	select {
+	case <-b.closed:
+		return
+	default:
+	}
+	b.mu.Lock()
+	if b.inSession {
+		b.mu.Unlock()
+		return
+	}
+	goodJobSnd := b.goodJobSoundFor(b.goodJobDogName)
+	goodJobCtx, goodJobCancel := context.WithCancel(context.Background())
+	b.goodJobToken++
+	myToken := b.goodJobToken
+	b.goodJobCancel = goodJobCancel
+	b.mu.Unlock()
+
+	go func() {
+		defer func() {
+			goodJobCancel()
+			b.mu.Lock()
+			if b.goodJobToken == myToken {
+				b.goodJobCancel = nil
+			}
+			b.mu.Unlock()
+		}()
+		b.playSound(goodJobCtx, goodJobSnd)
 	}()
 }
 
@@ -895,7 +918,7 @@ func (b *barkMonitor) Close(ctx context.Context) error {
 	b.closeOnce.Do(func() { close(b.closed) })
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	for _, t := range []*time.Timer{b.endTimer, b.warn2Timer, b.actionTimer} {
+	for _, t := range []*time.Timer{b.endTimer, b.warn2Timer, b.actionTimer, b.goodJobTimer} {
 		if t != nil {
 			t.Stop()
 		}
