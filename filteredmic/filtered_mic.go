@@ -31,6 +31,11 @@ type CapturedAudio struct {
 type AudioCapture interface {
 	RegisterConsumer(name resource.Name)
 	PopCapture(name resource.Name) *CapturedAudio
+	// Mute suppresses capture for dur, so the mic doesn't pick up sounds the
+	// system itself is playing (e.g. warning/good-job clips) and misclassify
+	// them as a bark. Calls extend any existing mute window rather than
+	// shortening it.
+	Mute(dur time.Duration)
 }
 
 // Model is the model triple for the filtered-mic component.
@@ -70,9 +75,10 @@ type filteredMic struct {
 	maxConsecutiveErrors int
 	logger               logging.Logger
 
-	mu               sync.Mutex
-	slots            map[resource.Name]*CapturedAudio
+	mu                sync.Mutex
+	slots             map[resource.Name]*CapturedAudio
 	consecutiveErrors int
+	muteUntil         time.Time
 }
 
 func newFilteredMic(ctx context.Context, deps resource.Dependencies, conf resource.Config, logger logging.Logger) (audioin.AudioIn, error) {
@@ -116,6 +122,13 @@ func (f *filteredMic) GetAudio(
 	previousTimestampNs int64,
 	extra map[string]interface{},
 ) (chan *audioin.AudioChunk, error) {
+	f.mu.Lock()
+	muted := time.Now().Before(f.muteUntil)
+	f.mu.Unlock()
+	if muted {
+		return nil, data.ErrNoCaptureToStore
+	}
+
 	// Always request audio relative to now rather than passing previousTimestampNs through.
 	// If we passed previousTimestampNs from the data manager, it would go stale whenever
 	// ErrNoCaptureToStore is returned (the data manager only advances it on successful captures),
@@ -198,6 +211,20 @@ func (f *filteredMic) GetAudio(
 	}()
 
 	return outChan, nil
+}
+
+// Mute suppresses capture for dur. Safe to call concurrently; extends any
+// existing mute window rather than shortening it.
+//
+// TODO: remove this workaround once the bark classifier is retrained to not
+// mistake the warning/good-job clips themselves for a bark.
+func (f *filteredMic) Mute(dur time.Duration) {
+	until := time.Now().Add(dur)
+	f.mu.Lock()
+	if until.After(f.muteUntil) {
+		f.muteUntil = until
+	}
+	f.mu.Unlock()
 }
 
 // RegisterConsumer creates a named slot for a consumer. Safe to call multiple
