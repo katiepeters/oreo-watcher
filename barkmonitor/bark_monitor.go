@@ -634,9 +634,37 @@ func (b *barkMonitor) playSound(ctx context.Context, wav []byte) {
 		b.logger.Warnw("failed to parse WAV for playback", "error", err)
 		return
 	}
+	// Mute the mic for the duration of playback plus a cooldown so it doesn't
+	// pick up this sound through speaker/room bleed and misclassify it as a
+	// bark, re-triggering a new session.
+	//
+	// TODO: remove this workaround once the bark classifier is retrained to
+	// not mistake the warning/good-job clips themselves for a bark.
+	b.audioCache.Mute(pcmDuration(pcm, info) + micMuteCooldown)
 	if err := b.speaker.Play(ctx, pcm, info, nil); err != nil && ctx.Err() == nil {
 		b.logger.Warnw("speaker play error", "error", err)
 	}
+}
+
+// micMuteCooldown is added after a sound's own duration when muting the mic,
+// to cover room echo/reverberation tail after playback ends.
+const micMuteCooldown = 1500 * time.Millisecond
+
+// pcmDuration returns the playback duration of raw PCM audio given its format info.
+func pcmDuration(pcm []byte, info *rutils.AudioInfo) time.Duration {
+	if info == nil || info.SampleRateHz == 0 || info.NumChannels == 0 {
+		return 0
+	}
+	bytesPerSample := 2 // pcm16 default
+	if info.Codec == rutils.CodecPCM32Float {
+		bytesPerSample = 4
+	}
+	blockAlign := int(info.NumChannels) * bytesPerSample
+	if blockAlign == 0 {
+		return 0
+	}
+	frames := len(pcm) / blockAlign
+	return time.Duration(frames) * time.Second / time.Duration(info.SampleRateHz)
 }
 
 // wavToPCM extracts raw PCM samples and audio info from a WAV byte slice.
