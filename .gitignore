@@ -172,3 +172,6 @@ spectrogen
 
 .DS_Store
 **/.DS_Store
+
+.vscode
+.claude
