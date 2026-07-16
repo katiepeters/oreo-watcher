@@ -95,7 +95,7 @@ func (s *spectrogramCam) Images(ctx context.Context, _ []string, _ map[string]in
 		sampleRate = int(capture.Chunks[0].AudioInfo.SampleRateHz)
 	}
 
-	samples := chunksToMono(capture.Chunks)
+	samples := ChunksToMono(capture.Chunks)
 	if len(samples) < fftSize {
 		return nil, resource.ResponseMetadata{}, data.ErrNoCaptureToStore
 	}
@@ -150,8 +150,8 @@ const (
 	specTotalH   = specImgH + specCaptionH
 )
 
-// chunksToMono decodes chunks to normalized mono float64 samples, averaging channels.
-func chunksToMono(chunks []*audioin.AudioChunk) []float64 {
+// ChunksToMono decodes chunks to normalized mono float64 samples, averaging channels.
+func ChunksToMono(chunks []*audioin.AudioChunk) []float64 {
 	var samples []float64
 	for _, chunk := range chunks {
 		if chunk == nil || len(chunk.AudioData) == 0 || chunk.AudioInfo == nil {
@@ -266,7 +266,7 @@ func melFilterbank(nMels, fftSize, sampleRate int, fMin, fMax float64) [][]float
 	return filters
 }
 
-func hzToMel(hz float64) float64 { return 2595 * math.Log10(1+hz/700) }
+func hzToMel(hz float64) float64  { return 2595 * math.Log10(1+hz/700) }
 func melToHz(mel float64) float64 { return 700 * (math.Pow(10, mel/2595) - 1) }
 
 func clampInt(v, lo, hi int) int {
@@ -326,7 +326,7 @@ func renderSpectrogram(frames [][]float64, capturedAt time.Time, startNs, endNs 
 
 		for y := 0; y < specImgH; y++ {
 			// y=0 is top of image = high frequency
-			mi := (specImgH-1-y) * nBins / specImgH
+			mi := (specImgH - 1 - y) * nBins / specImgH
 			if mi >= nBins {
 				mi = nBins - 1
 			}
@@ -373,7 +373,7 @@ func renderSpectrogram(frames [][]float64, capturedAt time.Time, startNs, endNs 
 // RenderChunks renders a spectrogram PNG directly from AudioChunks.
 // Exported so other components (e.g. bark-monitor) can classify the same image.
 func RenderChunks(chunks []*audioin.AudioChunk, sampleRate int, capturedAt time.Time, startNs, endNs int64, db float64) ([]byte, error) {
-	samples := chunksToMono(chunks)
+	samples := ChunksToMono(chunks)
 	if len(samples) < fftSize {
 		return nil, fmt.Errorf("not enough samples for spectrogram (%d < %d)", len(samples), fftSize)
 	}

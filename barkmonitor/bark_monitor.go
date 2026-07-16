@@ -23,6 +23,7 @@ import (
 	rutils "go.viam.com/rdk/utils"
 
 	filteredmic "github.com/katie-viam/oreo-watcher/filteredmic"
+	"github.com/katie-viam/oreo-watcher/modestate"
 )
 
 //go:embed sounds/leave_it.wav
@@ -91,7 +92,7 @@ type completedSession struct {
 	Warn1Fired        bool
 	Warn2Fired        bool
 	SecsAfterLastWarn float64 // seconds from last warning to session end; small = warning was effective
-	ClassifyErrors    int    // classification failures during the session
+	ClassifyErrors    int     // classification failures during the session
 }
 
 type barkMonitor struct {
@@ -108,8 +109,8 @@ type barkMonitor struct {
 	clipPad          time.Duration     // extra time to include before/after session in clips
 	name             resource.Name
 	logger           logging.Logger
-	warn1Sound []byte
-	warn2Sound []byte
+	warn1Sound       []byte
+	warn2Sound       []byte
 
 	gapDur    time.Duration
 	warnDur   time.Duration
@@ -118,11 +119,11 @@ type barkMonitor struct {
 	mu sync.Mutex
 
 	// Active session state.
-	inSession    bool
-	sessionStart time.Time
-	lastBarkTime time.Time
-	lastWarnTime time.Time
-	minDB        float64
+	inSession      bool
+	sessionStart   time.Time
+	lastBarkTime   time.Time
+	lastWarnTime   time.Time
+	minDB          float64
 	maxDB          float64
 	barkCount      int
 	warn1Played    bool
@@ -275,6 +276,15 @@ func (b *barkMonitor) Readings(ctx context.Context, extra map[string]interface{}
 	}
 	b.mu.Unlock()
 
+	// Trained Mode only runs when it's the active detection mode — Learning Mode
+	// handles classification/tagging otherwise. Only one mode is ever active.
+	if mode, err := modestate.GetDetectionMode(); err != nil {
+		b.logger.Warnw("failed to read detection mode, defaulting to inactive", "error", err)
+		return nil, data.ErrNoCaptureToStore
+	} else if mode != modestate.DetectionModeTrained {
+		return nil, data.ErrNoCaptureToStore
+	}
+
 	capture := b.audioCache.PopCapture(b.name)
 
 	classifications, classifyErr := b.visSvc.ClassificationsFromCamera(ctx, b.classifierCamera, 1, nil)
@@ -287,7 +297,7 @@ func (b *barkMonitor) Readings(ctx context.Context, extra map[string]interface{}
 			if capture != nil {
 				db = capture.DB
 				if len(capture.Chunks) > 0 {
-					barkStart = chunkStartTime(capture.Chunks[0])
+					barkStart = ChunkStartTime(capture.Chunks[0])
 				}
 			}
 			b.onBarkDetected(db, barkStart)
@@ -808,10 +818,10 @@ func (b *barkMonitor) saveVideoClip(vsvc namedVideoSvc, start, end time.Time, ba
 	}
 }
 
-// chunkStartTime returns the wall-clock time of the first sample in the chunk,
+// ChunkStartTime returns the wall-clock time of the first sample in the chunk,
 // derived from EndTimestampNanoseconds and the chunk's PCM frame count.
 // Returns zero time if the chunk lacks the necessary metadata.
-func chunkStartTime(c *audioin.AudioChunk) time.Time {
+func ChunkStartTime(c *audioin.AudioChunk) time.Time {
 	if c == nil || c.AudioInfo == nil || c.AudioInfo.SampleRateHz == 0 || len(c.AudioData) == 0 {
 		return time.Time{}
 	}
@@ -834,7 +844,7 @@ func chunkStartTime(c *audioin.AudioChunk) time.Time {
 // chunkAudioOffset returns how many seconds the chunk's first sample is offset
 // from referenceTime. Negative = audio starts before reference; positive = after.
 func chunkAudioOffset(c *audioin.AudioChunk, referenceTime time.Time) float64 {
-	t := chunkStartTime(c)
+	t := ChunkStartTime(c)
 	if t.IsZero() {
 		return 0
 	}
@@ -885,6 +895,25 @@ func muxAudioIntoVideo(videoPath, audioPath string, audioOffsetSec float64) erro
 
 // writeSessionWAV assembles AudioChunks into a WAV file in dir and returns the path.
 func writeSessionWAV(dir string, start, end time.Time, chunks []*audioin.AudioChunk) (string, error) {
+	wavBytes, err := WAVBytesFromChunks(chunks)
+	if err != nil {
+		return "", err
+	}
+
+	dur := int(end.Sub(start).Seconds())
+	filename := fmt.Sprintf("bark_%s_%ds.wav", start.Format("2006-01-02_15-04-05"), dur)
+	path := filepath.Join(dir, filename)
+
+	if err := os.WriteFile(path, wavBytes, 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// WAVBytesFromChunks encodes a sequence of AudioChunks as an in-memory RIFF/WAVE
+// file, concatenating their PCM data in order. Exported so other components
+// (e.g. learningmode) can produce WAV bytes for upload without writing a file.
+func WAVBytesFromChunks(chunks []*audioin.AudioChunk) ([]byte, error) {
 	// Find first chunk with valid audio info.
 	var info *rutils.AudioInfo
 	for _, c := range chunks {
@@ -894,7 +923,7 @@ func writeSessionWAV(dir string, start, end time.Time, chunks []*audioin.AudioCh
 		}
 	}
 	if info == nil {
-		return "", fmt.Errorf("no AudioInfo found in chunks")
+		return nil, fmt.Errorf("no AudioInfo found in chunks")
 	}
 
 	sampleRate := int(info.SampleRateHz)
@@ -927,44 +956,28 @@ func writeSessionWAV(dir string, start, end time.Time, chunks []*audioin.AudioCh
 		}
 	}
 
-	dur := int(end.Sub(start).Seconds())
-	filename := fmt.Sprintf("bark_%s_%ds.wav", start.Format("2006-01-02_15-04-05"), dur)
-	path := filepath.Join(dir, filename)
+	buf := make([]byte, 44, 44+totalDataSize)
+	copy(buf[0:], "RIFF")
+	binary.LittleEndian.PutUint32(buf[4:], uint32(36+totalDataSize))
+	copy(buf[8:], "WAVE")
+	copy(buf[12:], "fmt ")
+	binary.LittleEndian.PutUint32(buf[16:], 16)
+	binary.LittleEndian.PutUint16(buf[20:], uint16(audioFormat))
+	binary.LittleEndian.PutUint16(buf[22:], uint16(numChannels))
+	binary.LittleEndian.PutUint32(buf[24:], uint32(sampleRate))
+	binary.LittleEndian.PutUint32(buf[28:], uint32(byteRate))
+	binary.LittleEndian.PutUint16(buf[32:], uint16(blockAlign))
+	binary.LittleEndian.PutUint16(buf[34:], uint16(bitsPerSample))
+	copy(buf[36:], "data")
+	binary.LittleEndian.PutUint32(buf[40:], uint32(totalDataSize))
 
-	f, err := os.Create(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	// Write RIFF/WAVE header.
-	hdr := make([]byte, 44)
-	copy(hdr[0:], "RIFF")
-	binary.LittleEndian.PutUint32(hdr[4:], uint32(36+totalDataSize))
-	copy(hdr[8:], "WAVE")
-	copy(hdr[12:], "fmt ")
-	binary.LittleEndian.PutUint32(hdr[16:], 16)
-	binary.LittleEndian.PutUint16(hdr[20:], uint16(audioFormat))
-	binary.LittleEndian.PutUint16(hdr[22:], uint16(numChannels))
-	binary.LittleEndian.PutUint32(hdr[24:], uint32(sampleRate))
-	binary.LittleEndian.PutUint32(hdr[28:], uint32(byteRate))
-	binary.LittleEndian.PutUint16(hdr[32:], uint16(blockAlign))
-	binary.LittleEndian.PutUint16(hdr[34:], uint16(bitsPerSample))
-	copy(hdr[36:], "data")
-	binary.LittleEndian.PutUint32(hdr[40:], uint32(totalDataSize))
-
-	if _, err := f.Write(hdr); err != nil {
-		return "", err
-	}
 	for _, c := range chunks {
 		if c != nil && len(c.AudioData) > 0 {
-			if _, err := f.Write(c.AudioData); err != nil {
-				return "", err
-			}
+			buf = append(buf, c.AudioData...)
 		}
 	}
 
-	return path, nil
+	return buf, nil
 }
 
 // pulseWAV trims a WAV to totalDur and applies a pulsing gate: audio alternates

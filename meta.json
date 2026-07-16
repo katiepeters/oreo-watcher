@@ -43,6 +43,12 @@
     },
     {
       "api": "rdk:component:sensor",
+      "model": "katie-viam:oreo-watcher:learning-mode",
+      "short_description": "Zero-training bark classifier using YAMNet; tags and uploads audio/spectrogram pairs for review, never plays sounds",
+      "markdown_link": "README.md#model-katie-viamoreo-watcherlearning-mode"
+    },
+    {
+      "api": "rdk:component:sensor",
       "model": "katie-viam:oreo-watcher:activity-monitor",
       "short_description": "Sensor that detects whether Oreo is on his bed and tracks movement and sleep sessions",
       "markdown_link": "README.md#model-katie-viamoreo-watcheractivity-monitor"

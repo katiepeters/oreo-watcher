@@ -4,10 +4,12 @@ go 1.25.1
 
 require (
 	github.com/fogleman/gg v1.3.0
+	github.com/hajimehoshi/go-mp3 v0.3.4
 	go.viam.com/rdk v0.126.0
 	go.viam.com/utils v0.4.19
 	golang.org/x/image v0.25.0
 	gonum.org/v1/gonum v0.17.0
+	gorgonia.org/tensor v0.9.24
 )
 
 require (
@@ -93,7 +95,6 @@ require (
 	github.com/gorilla/securecookie v1.1.2 // indirect
 	github.com/grpc-ecosystem/go-grpc-middleware v1.4.0 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.27.7 // indirect
-	github.com/hajimehoshi/go-mp3 v0.3.4 // indirect
 	github.com/hashicorp/aws-sdk-go-base/v2 v2.0.0-beta.65 // indirect
 	github.com/hashicorp/go-cleanhttp v0.5.2 // indirect
 	github.com/hashicorp/go-getter v1.8.3 // indirect
@@ -208,7 +209,6 @@ require (
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
-	gorgonia.org/tensor v0.9.24 // indirect
 	gorgonia.org/vecf32 v0.9.0 // indirect
 	gorgonia.org/vecf64 v0.9.0 // indirect
 	nhooyr.io/websocket v1.8.7 // indirect
