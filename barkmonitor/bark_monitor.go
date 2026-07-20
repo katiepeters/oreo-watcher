@@ -46,6 +46,15 @@ func init() {
 
 const recordingDir = "/root/bark-recordings"
 
+// Candidate-upload data is attributed to these fixed component names rather
+// than this sensor's own name — matching learningmode's convention, so
+// candidate uploads from either detection backend land under the same
+// filter-mic/spectro-cam grouping in the Data tab.
+const (
+	uploadComponentNameAudio       = "filter-mic"
+	uploadComponentNameSpectrogram = "spectro-cam"
+)
+
 type namedVideoSvc struct {
 	name string
 	svc  video.Service
@@ -318,10 +327,22 @@ func (b *barkMonitor) Readings(ctx context.Context, extra map[string]interface{}
 
 	// Trained Mode only runs when it's the active detection mode — Learning Mode
 	// handles classification/tagging otherwise. Only one mode is ever active.
+	//
+	// Still pop (and discard) our own capture slot even when it's not our
+	// turn — filtered-mic broadcasts each capture to every registered
+	// consumer's own slot regardless of mode, and a slot that's never popped
+	// just sits there holding the latest capture indefinitely. If we
+	// returned early without popping, whatever capture was sitting here from
+	// while we were inactive would get picked up and reprocessed the moment
+	// the mode switches to us — even though the other mode may have already
+	// handled that exact same capture. Draining it here instead means once
+	// we do become active, we only ever see captures that arrived after that.
 	if mode, err := modestate.GetDetectionMode(); err != nil {
 		b.logger.Warnw("failed to read detection mode, defaulting to inactive", "error", err)
+		b.audioCache.PopCapture(b.name)
 		return nil, data.ErrNoCaptureToStore
 	} else if mode != modestate.DetectionModeTrained {
+		b.audioCache.PopCapture(b.name)
 		return nil, data.ErrNoCaptureToStore
 	}
 
@@ -329,20 +350,35 @@ func (b *barkMonitor) Readings(ctx context.Context, extra map[string]interface{}
 
 	// n=0 requests all results, not just the top one — the vision service's
 	// own default_minimum_confidence (0.65) already filters to labels that
-	// cleared threshold, and the model is multi-label: each positive label
-	// is a dog's name, so more than one dog can be flagged on the same clip.
+	// cleared threshold. Some models are multi-label (each positive label is
+	// a dog's name, so more than one dog can be flagged on the same clip);
+	// others (e.g. the current single-class model) just return "bark"/
+	// "no-bark"/"not-bark" with no dog identity at all. Handle both: "bark"
+	// sets isBark but is never treated as a dog name, so it doesn't end up
+	// as a bogus tag like "bark-bark-candidate" or a TTS line like "bark,
+	// bark detected" — and any spelling of the negative label is matched
+	// explicitly, rather than falling through to "must be a dog name" by
+	// default, so an unexpected label string can't silently misfire the
+	// same way (this is exactly how "not-bark" briefly became
+	// "not-bark-bark-candidate" before this list included it).
 	classifications, classifyErr := b.visSvc.ClassificationsFromCamera(ctx, b.classifierCamera, 0, nil)
 	if classifyErr == nil && len(classifications) > 0 {
 		var detectedDogs []string
+		isBark := false
 		for _, c := range classifications {
 			b.logger.Debugf("classification: %s %.3f", c.Label(), c.Score())
-			if c.Label() != "no-bark" {
+			switch c.Label() {
+			case "no-bark", "not-bark":
+				// not a bark
+			case "bark":
+				isBark = true // generic single-class model; no specific dog identified
+			default:
 				detectedDogs = append(detectedDogs, c.Label())
+				isBark = true
 			}
 		}
-		isBark := len(detectedDogs) > 0
 		if capture != nil {
-			b.uploadCandidate(ctx, capture, detectedDogs)
+			b.uploadCandidate(ctx, capture, isBark, detectedDogs)
 		}
 		if isBark {
 			db := 0.0
@@ -395,21 +431,28 @@ func sessionReading(s *completedSession) map[string]interface{} {
 // what the classifier camera saw) and uploads it, plus the raw audio, tagged
 // for human review. This feeds Trained Mode's own classifications back into
 // the same tagging queue Learning Mode uses. detectedDogs holds each
-// classification label that cleared the vision service's own confidence
-// threshold and isn't "no-bark" — the model is multi-label, so more than one
-// dog's name can come back for the same clip; each gets its own
-// "<dog>-bark-candidate" tag on the single uploaded audio/image pair,
-// mirroring how human-confirmed tags already support multiple dogs per clip.
-// A no-op if dataClient couldn't be constructed (e.g. missing API key env
+// classification label that isn't "bark"/"no-bark" — for multi-label models,
+// each positive label is a dog's name, so more than one dog can come back for
+// the same clip; each gets its own "<dog>-bark-candidate" tag. Whenever
+// isBark is true, a plain "bark-candidate" tag is always included alongside
+// any per-dog tags, so the web app has one reliable tag to filter on
+// regardless of which model (single-class or multi-label) is deployed. A
+// no-op if dataClient couldn't be constructed (e.g. missing API key env
 // vars) — core detection/warnings don't depend on this.
-func (b *barkMonitor) uploadCandidate(ctx context.Context, capture *filteredmic.CapturedAudio, detectedDogs []string) {
+func (b *barkMonitor) uploadCandidate(ctx context.Context, capture *filteredmic.CapturedAudio, isBark bool, detectedDogs []string) {
 	if b.dataClient == nil || len(capture.Chunks) == 0 {
 		return
 	}
 	var tags []string
-	if len(detectedDogs) == 0 {
+	if !isBark {
 		tags = []string{"no-bark-candidate"}
 	} else {
+		tags = []string{"bark-candidate"}
+		if len(detectedDogs) == 0 {
+			// TODO: temporary hardcode until the deployed model identifies
+			// dogs by name — this machine only has Oreo on it for now.
+			tags = append(tags, "Oreo-bark-candidate")
+		}
 		for _, dog := range detectedDogs {
 			tags = append(tags, fmt.Sprintf("%s-bark-candidate", dog))
 		}
@@ -438,13 +481,13 @@ func (b *barkMonitor) uploadCandidate(ctx context.Context, capture *filteredmic.
 	uploadTimes := &[2]time.Time{capture.CapturedAt, capture.CapturedAt}
 
 	if _, err := b.dataClient.BinaryDataCaptureUpload(ctx, audioBytes, b.partID,
-		"rdk:component:audio_in", b.name.Name, "GetAudio", "wav",
+		"rdk:component:audio_in", uploadComponentNameAudio, "GetAudio", "wav",
 		&app.BinaryDataCaptureUploadOptions{Tags: tags, DataRequestTimes: uploadTimes}); err != nil {
 		b.logger.Warnw("uploading candidate audio failed", "error", err)
 		return
 	}
 	if _, err := b.dataClient.BinaryDataCaptureUpload(ctx, imgBytes, b.partID,
-		"rdk:component:camera", b.name.Name, "GetImage", "png",
+		"rdk:component:camera", uploadComponentNameSpectrogram, "GetImage", "png",
 		&app.BinaryDataCaptureUploadOptions{Tags: tags, DataRequestTimes: uploadTimes}); err != nil {
 		b.logger.Warnw("uploading candidate spectrogram failed", "error", err)
 	}

@@ -19,12 +19,6 @@
     },
     {
       "api": "rdk:component:camera",
-      "model": "katie-viam:oreo-watcher:waveform-cam",
-      "short_description": "Camera that renders audio waveform images from a filtered-mic component",
-      "markdown_link": "README.md#model-katie-viamoreo-watcherwaveform-cam"
-    },
-    {
-      "api": "rdk:component:camera",
       "model": "katie-viam:oreo-watcher:spectrogram-cam",
       "short_description": "Camera that renders log-mel spectrogram images from a filtered-mic component",
       "markdown_link": "README.md#model-katie-viamoreo-watcherspectrogram-cam"

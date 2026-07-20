@@ -59,24 +59,43 @@ const (
 	// instance backing yamnet_service must have its model_path config
 	// attribute set to this same path.
 	YamnetModelPath = "/root/models/yamnet.tflite"
+
+	// Uploaded data is attributed to these fixed component names rather than
+	// this sensor's own name, since it really is mic/spectrogram data — not
+	// tied to any actual configured dependency here, so any deployment using
+	// this component's own componentName convention should use the same
+	// filter-mic/spectro-cam names for consistency with bark_monitor's uploads.
+	uploadComponentNameAudio       = "filter-mic"
+	uploadComponentNameSpectrogram = "spectro-cam"
 )
 
-// ensureModelFile writes the embedded YAMNet .tflite model to YamnetModelPath
+// EnsureModelFile writes the embedded YAMNet .tflite model to YamnetModelPath
 // if it isn't already there, so a fresh machine doesn't need the model
 // manually copied on before this module (and the tflite_cpu service pointed
-// at YamnetModelPath) can work.
-func ensureModelFile() error {
+// at YamnetModelPath) can work. Logs a clear, greppable line either way so
+// it's easy to confirm from the module's logs whether this ran and what it did.
+//
+// Exported so main.go can call this unconditionally at module process
+// startup, independent of any resource's dependency graph — the tflite_cpu
+// service backing yamnet_service fails to construct if this file doesn't
+// exist yet, and learning-mode itself depends on that service being healthy,
+// so writing the file only from learning-mode's own constructor would
+// deadlock: tflite_cpu never succeeds, so learning-mode never runs to
+// create the file that would let it succeed.
+func EnsureModelFile(logger logging.Logger) error {
 	if _, err := os.Stat(YamnetModelPath); err == nil {
-		return nil // already present
+		logger.Infow("learning-mode: yamnet model file already present, not overwriting", "path", YamnetModelPath)
+		return nil
 	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("checking for existing model file: %w", err)
+		return fmt.Errorf("checking for existing model file at %s: %w", YamnetModelPath, err)
 	}
 	if err := os.MkdirAll(filepath.Dir(YamnetModelPath), 0o755); err != nil {
-		return fmt.Errorf("creating model directory: %w", err)
+		return fmt.Errorf("creating model directory %s: %w", filepath.Dir(YamnetModelPath), err)
 	}
 	if err := os.WriteFile(YamnetModelPath, yamnetModelBytes, 0o644); err != nil {
-		return fmt.Errorf("writing embedded model file: %w", err)
+		return fmt.Errorf("writing embedded model file to %s: %w", YamnetModelPath, err)
 	}
+	logger.Infow("learning-mode: wrote embedded yamnet model to disk", "path", YamnetModelPath, "bytes", len(yamnetModelBytes))
 	return nil
 }
 
@@ -120,12 +139,18 @@ type learningMode struct {
 }
 
 func newLearningMode(ctx context.Context, deps resource.Dependencies, conf resource.Config, logger logging.Logger) (sensor.Sensor, error) {
+	logger.Infow("learning-mode: constructing", "name", conf.ResourceName().Name)
+
 	cfg, err := resource.NativeConfig[*Config](conf)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := ensureModelFile(); err != nil {
+	// Safety net — main.go already calls this unconditionally at module
+	// startup (see its doc comment for why it can't only happen here), but
+	// this is idempotent and cheap, so it's harmless to double-check.
+	if err := EnsureModelFile(logger); err != nil {
+		logger.Errorw("learning-mode: failed to ensure yamnet model file", "error", err)
 		return nil, fmt.Errorf("ensuring yamnet model file: %w", err)
 	}
 
@@ -199,12 +224,21 @@ func newLearningMode(ctx context.Context, deps resource.Dependencies, conf resou
 func (l *learningMode) Readings(ctx context.Context, extra map[string]interface{}) (map[string]interface{}, error) {
 	// Only one detection mode is ever active. Trained Mode (bark_monitor)
 	// handles classification otherwise.
+	//
+	// Still pop (and discard) our own capture slot even when it's not our
+	// turn — see the matching comment in bark_monitor.go's Readings() for
+	// why: filtered-mic broadcasts each capture to every registered
+	// consumer's own slot regardless of mode, and an undrained slot would
+	// resurface a stale, already-processed-by-the-other-mode capture the
+	// moment this mode becomes active again.
 	mode, err := modestate.GetDetectionMode()
 	if err != nil {
 		l.logger.Warnw("failed to read detection mode, defaulting to inactive", "error", err)
+		l.audioCache.PopCapture(l.name)
 		return nil, data.ErrNoCaptureToStore
 	}
 	if mode != modestate.DetectionModeLearning {
+		l.audioCache.PopCapture(l.name)
 		return nil, data.ErrNoCaptureToStore
 	}
 
@@ -250,13 +284,13 @@ func (l *learningMode) Readings(ctx context.Context, extra map[string]interface{
 	uploadTimes := &[2]time.Time{capture.CapturedAt, capture.CapturedAt}
 
 	if _, err := l.dataClient.BinaryDataCaptureUpload(ctx, audioBytes, l.partID,
-		"rdk:component:audio_in", l.name.Name, "GetAudio", "wav",
+		"rdk:component:audio_in", uploadComponentNameAudio, "GetAudio", "wav",
 		&app.BinaryDataCaptureUploadOptions{Tags: []string{tag}, DataRequestTimes: uploadTimes}); err != nil {
 		l.logger.Warnw("uploading audio clip failed", "error", err)
 		return nil, data.ErrNoCaptureToStore
 	}
 	if _, err := l.dataClient.BinaryDataCaptureUpload(ctx, imgBytes, l.partID,
-		"rdk:component:camera", l.name.Name, "GetImage", "png",
+		"rdk:component:camera", uploadComponentNameSpectrogram, "GetImage", "png",
 		&app.BinaryDataCaptureUploadOptions{Tags: []string{tag}, DataRequestTimes: uploadTimes}); err != nil {
 		l.logger.Warnw("uploading spectrogram failed", "error", err)
 		return nil, data.ErrNoCaptureToStore

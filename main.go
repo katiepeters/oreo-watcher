@@ -18,7 +18,6 @@ import (
 	movementmonitor "github.com/katie-viam/oreo-watcher/movementmonitor"
 	sleepmonitor "github.com/katie-viam/oreo-watcher/sleepmonitor"
 	spectrogramcam "github.com/katie-viam/oreo-watcher/spectrogramcam"
-	waveformcam "github.com/katie-viam/oreo-watcher/waveformcam"
 )
 
 func main() {
@@ -26,16 +25,22 @@ func main() {
 }
 
 func mainWithArgs(ctx context.Context, args []string, logger logging.Logger) error {
+	// Must happen before any resource construction, and independent of any
+	// resource's dependency graph: the tflite_cpu mlmodel service backing
+	// learning-mode's yamnet_service fails to construct if this file doesn't
+	// exist yet, and learning-mode itself depends on that service being
+	// healthy — so writing the file only from learning-mode's own
+	// constructor would deadlock. See EnsureModelFile's doc comment.
+	if err := learningmode.EnsureModelFile(logger); err != nil {
+		logger.Errorw("failed to ensure yamnet model file at startup", "error", err)
+	}
+
 	myMod, err := module.NewModuleFromArgs(ctx)
 	if err != nil {
 		return err
 	}
 
 	if err = myMod.AddModelFromRegistry(ctx, audioin.API, filteredmic.Model); err != nil {
-		return err
-	}
-
-	if err = myMod.AddModelFromRegistry(ctx, camera.API, waveformcam.Model); err != nil {
 		return err
 	}
 
