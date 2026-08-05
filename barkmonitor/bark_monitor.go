@@ -79,6 +79,18 @@ type Config struct {
 	// (live-view-only), since this deploys in other people's homes; set true on
 	// a machine where storing footage is acceptable (e.g. your own).
 	StoreVideoClips bool `json:"store_video_clips"`
+
+	// Custom sounds: a configured static WAV file always takes precedence
+	// over the dynamic TTS lines — a per-dog file only applies when exactly
+	// one dog was identified (a single static clip can't represent multiple
+	// dogs barking together), then the generic default path, then TTS, then
+	// the embedded WAV as the last resort. Nothing needs to be configured —
+	// today's reality is nobody has recorded custom sounds yet, so this
+	// falls through to TTS automatically until per-user recordings exist.
+	WarningSoundPath string            `json:"warning_sound_path"`  // optional: filesystem path to default warning WAV
+	GoodJobSoundPath string            `json:"good_job_sound_path"` // optional: filesystem path to default good-job WAV
+	DogWarningSounds map[string]string `json:"dog_warning_sounds"`  // dog name -> WAV path
+	DogGoodJobSounds map[string]string `json:"dog_good_job_sounds"` // dog name -> WAV path
 }
 
 // Validate ensures the config is valid and returns required dependencies.
@@ -136,6 +148,14 @@ type barkMonitor struct {
 	// since core bark detection/warnings don't depend on it.
 	dataClient *app.DataClient
 	partID     string
+
+	// Static sounds loaded once at construction from configured filesystem
+	// paths, if any. nil/empty when not configured — see warnSoundFor and
+	// goodJobSoundFor for how these combine with dynamic TTS.
+	defaultWarnSound    []byte
+	defaultGoodJobSound []byte
+	dogWarnSounds       map[string][]byte
+	dogGoodJobSounds    map[string][]byte
 
 	gapDur    time.Duration
 	warnDur   time.Duration
@@ -286,28 +306,84 @@ func newBarkMonitor(ctx context.Context, deps resource.Dependencies, conf resour
 		}
 	}
 
+	// Static sounds are optional — nothing configured just means the
+	// combined warnSoundFor/goodJobSoundFor lookup falls through to TTS.
+	// A configured path that fails to load is a soft failure (logged, not
+	// fatal), same reasoning as the dataClient setup above.
+	var defaultWarnSound, defaultGoodJobSound []byte
+	if cfg.WarningSoundPath != "" {
+		if snd, err := loadSound(cfg.WarningSoundPath, nil); err != nil {
+			logger.Warnw("failed to load warning_sound_path, will fall back to TTS/embedded default",
+				"path", cfg.WarningSoundPath, "error", err)
+		} else {
+			defaultWarnSound = snd
+		}
+	}
+	if cfg.GoodJobSoundPath != "" {
+		if snd, err := loadSound(cfg.GoodJobSoundPath, nil); err != nil {
+			logger.Warnw("failed to load good_job_sound_path, will fall back to TTS/embedded default",
+				"path", cfg.GoodJobSoundPath, "error", err)
+		} else {
+			defaultGoodJobSound = snd
+		}
+	}
+	dogWarnSounds := make(map[string][]byte, len(cfg.DogWarningSounds))
+	for dog, path := range cfg.DogWarningSounds {
+		snd, err := loadSound(path, nil)
+		if err != nil {
+			logger.Warnw("failed to load dog_warning_sounds entry, will fall back to default/TTS", "dog", dog, "path", path, "error", err)
+			continue
+		}
+		dogWarnSounds[dog] = snd
+	}
+	dogGoodJobSounds := make(map[string][]byte, len(cfg.DogGoodJobSounds))
+	for dog, path := range cfg.DogGoodJobSounds {
+		snd, err := loadSound(path, nil)
+		if err != nil {
+			logger.Warnw("failed to load dog_good_job_sounds entry, will fall back to default/TTS", "dog", dog, "path", path, "error", err)
+			continue
+		}
+		dogGoodJobSounds[dog] = snd
+	}
+
 	name := conf.ResourceName()
 	cache.RegisterConsumer(name)
 
 	return &barkMonitor{
-		Named:            name.AsNamed(),
-		dataClient:       dataClient,
-		partID:           partID,
-		audioCache:       cache,
-		visSvc:           visSvc,
-		classifierCamera: cfg.ClassifierCamera,
-		recordingDir:     recordingDir,
-		recordingMic:     recordingMic,
-		speaker:          speaker,
-		videoServices:    videoServices,
-		name:             name,
-		logger:           logger,
-		gapDur:           time.Duration(float64(time.Second) * gapSec),
-		warnDur:          time.Duration(float64(time.Second) * warnSec),
-		actionDur:        time.Duration(float64(time.Second) * actionSec),
-		clipPad:          time.Duration(float64(time.Second) * clipPadSec),
-		closed:           make(chan struct{}),
+		Named:               name.AsNamed(),
+		dataClient:          dataClient,
+		partID:              partID,
+		audioCache:          cache,
+		visSvc:              visSvc,
+		classifierCamera:    cfg.ClassifierCamera,
+		recordingDir:        recordingDir,
+		recordingMic:        recordingMic,
+		speaker:             speaker,
+		videoServices:       videoServices,
+		name:                name,
+		logger:              logger,
+		defaultWarnSound:    defaultWarnSound,
+		defaultGoodJobSound: defaultGoodJobSound,
+		dogWarnSounds:       dogWarnSounds,
+		dogGoodJobSounds:    dogGoodJobSounds,
+		gapDur:              time.Duration(float64(time.Second) * gapSec),
+		warnDur:             time.Duration(float64(time.Second) * warnSec),
+		actionDur:           time.Duration(float64(time.Second) * actionSec),
+		clipPad:             time.Duration(float64(time.Second) * clipPadSec),
+		closed:              make(chan struct{}),
 	}, nil
+}
+
+// loadSound returns the WAV bytes at path, or fallback if path is empty.
+func loadSound(path string, fallback []byte) ([]byte, error) {
+	if path == "" {
+		return fallback, nil
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("loading sound %q: %w", path, err)
+	}
+	return b, nil
 }
 
 // Readings classifies the latest spectrogram, updates session state, and returns
@@ -527,7 +603,7 @@ func (b *barkMonitor) onBarkDetected(db float64, barkStart time.Time, detectedDo
 			b.goodJobCancel = nil
 		}
 		go func() {
-			sound := b.synthesizeOrFallback(barkDetectedPhrase(detectedDogs), leaveItSound)
+			sound := b.warnSoundFor(detectedDogs)
 			b.playSound(context.Background(), sound)
 			b.mu.Lock()
 			defer b.mu.Unlock()
@@ -575,7 +651,7 @@ func (b *barkMonitor) onSecondWarn() {
 	b.logger.Infof("bark session warning 2 emitted (%.0fs elapsed)", time.Since(b.sessionStart).Seconds())
 	dogs := b.sessionDogs // snapshot while holding b.mu; slice header copy is safe to read after unlock
 	go func() {
-		sound := b.synthesizeOrFallback(barkDetectedPhrase(dogs), leaveItSound)
+		sound := b.warnSoundFor(dogs)
 		b.playSound(context.Background(), sound)
 		b.mu.Lock()
 		defer b.mu.Unlock()
@@ -781,7 +857,7 @@ func (b *barkMonitor) onGoodJob() {
 			}
 			b.mu.Unlock()
 		}()
-		sound := b.synthesizeOrFallback(barkingStoppedPhrase(dogs), goodJobSound)
+		sound := b.goodJobSoundFor(dogs)
 		b.playSound(goodJobCtx, sound)
 	}()
 }
@@ -872,6 +948,37 @@ func (b *barkMonitor) synthesizeOrFallback(text string, fallback []byte) []byte 
 	return sound
 }
 
+// warnSoundFor returns the sound to play when a bark session starts, for the
+// given detected dog(s). Preference order: a configured per-dog static file
+// (only when exactly one dog was identified — a single static clip can't
+// represent multiple dogs barking together), then a configured generic
+// default file, then dynamic TTS naming the detected dog(s), then the
+// embedded static WAV as the last resort if TTS itself fails.
+func (b *barkMonitor) warnSoundFor(detectedDogs []string) []byte {
+	if len(detectedDogs) == 1 {
+		if snd, ok := b.dogWarnSounds[detectedDogs[0]]; ok {
+			return snd
+		}
+	}
+	if b.defaultWarnSound != nil {
+		return b.defaultWarnSound
+	}
+	return b.synthesizeOrFallback(barkDetectedPhrase(detectedDogs), leaveItSound)
+}
+
+// goodJobSoundFor is warnSoundFor's counterpart for the session-end sound.
+func (b *barkMonitor) goodJobSoundFor(detectedDogs []string) []byte {
+	if len(detectedDogs) == 1 {
+		if snd, ok := b.dogGoodJobSounds[detectedDogs[0]]; ok {
+			return snd
+		}
+	}
+	if b.defaultGoodJobSound != nil {
+		return b.defaultGoodJobSound
+	}
+	return b.synthesizeOrFallback(barkingStoppedPhrase(detectedDogs), goodJobSound)
+}
+
 // playSound plays WAV bytes via the configured speaker component. Blocks until playback completes.
 // Must NOT be called with b.mu held — callers should launch a goroutine.
 func (b *barkMonitor) playSound(ctx context.Context, wav []byte) {
@@ -957,7 +1064,7 @@ func (b *barkMonitor) DoCommand(ctx context.Context, cmd map[string]interface{})
 		dogs := b.sessionDogs
 		b.mu.Unlock()
 		go func() {
-			sound := b.synthesizeOrFallback(barkDetectedPhrase(dogs), leaveItSound)
+			sound := b.warnSoundFor(dogs)
 			b.playSound(context.Background(), sound)
 		}()
 		return map[string]interface{}{"ok": true}, nil
@@ -966,7 +1073,7 @@ func (b *barkMonitor) DoCommand(ctx context.Context, cmd map[string]interface{})
 		dogs := b.sessionDogs
 		b.mu.Unlock()
 		go func() {
-			sound := b.synthesizeOrFallback(barkingStoppedPhrase(dogs), goodJobSound)
+			sound := b.goodJobSoundFor(dogs)
 			b.playSound(context.Background(), sound)
 		}()
 		return map[string]interface{}{"ok": true}, nil
