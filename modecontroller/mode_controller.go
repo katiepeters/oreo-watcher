@@ -8,6 +8,8 @@ import (
 	"go.viam.com/rdk/components/sensor"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
+
+	"github.com/katie-viam/oreo-watcher/modestate"
 )
 
 // Model is the model triple for the mode-controller sensor component.
@@ -78,9 +80,15 @@ func newModeController(ctx context.Context, deps resource.Dependencies, conf res
 	if controlKey == "" {
 		controlKey = defaultControlKey
 	}
+	mode := ModeHome
+	if persisted, err := modestate.GetOperatingMode(); err != nil {
+		logger.Warnw("failed to read persisted operating mode, defaulting to home", "error", err)
+	} else if persisted != "" {
+		mode = Mode(persisted)
+	}
 	return &modeController{
 		Named:            conf.ResourceName().AsNamed(),
-		mode:             ModeHome,
+		mode:             mode,
 		cameraComponents: cfg.CameraComponents,
 		controlKey:       controlKey,
 		logger:           logger,
@@ -130,10 +138,13 @@ func (m *modeController) Readings(ctx context.Context, extra map[string]interfac
 	return map[string]interface{}{m.controlKey: entries}, nil
 }
 
-// DoCommand supports set_mode and get_mode commands.
+// DoCommand supports set_mode/get_mode (away/away_lite/home, persisted) and
+// set_detection_mode/get_detection_mode (learning/trained, persisted) commands.
 //
 //	{"command": "set_mode", "mode": "away"|"away_lite"|"home"}
 //	{"command": "get_mode"}
+//	{"command": "set_detection_mode", "mode": "learning"|"trained"}
+//	{"command": "get_detection_mode"}
 func (m *modeController) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
 	command, _ := cmd["command"].(string)
 	switch command {
@@ -141,6 +152,9 @@ func (m *modeController) DoCommand(ctx context.Context, cmd map[string]interface
 		modeStr, _ := cmd["mode"].(string)
 		switch Mode(modeStr) {
 		case ModeAway, ModeAwayLite, ModeHome:
+			if err := modestate.SetOperatingMode(modeStr); err != nil {
+				return nil, fmt.Errorf("persisting operating mode: %w", err)
+			}
 			m.mu.Lock()
 			old := m.mode
 			m.mode = Mode(modeStr)
@@ -152,8 +166,27 @@ func (m *modeController) DoCommand(ctx context.Context, cmd map[string]interface
 		}
 	case "get_mode":
 		return map[string]interface{}{"mode": string(m.Mode())}, nil
+	case "set_detection_mode":
+		modeStr, _ := cmd["mode"].(string)
+		switch modeStr {
+		case modestate.DetectionModeLearning, modestate.DetectionModeTrained:
+			if err := modestate.SetDetectionMode(modeStr); err != nil {
+				return nil, fmt.Errorf("persisting detection mode: %w", err)
+			}
+			m.logger.Infof("detection mode changed to %s", modeStr)
+			return map[string]interface{}{"detection_mode": modeStr}, nil
+		default:
+			return nil, fmt.Errorf("unknown detection mode %q; supported: %s, %s",
+				modeStr, modestate.DetectionModeLearning, modestate.DetectionModeTrained)
+		}
+	case "get_detection_mode":
+		detectionMode, err := modestate.GetDetectionMode()
+		if err != nil {
+			return nil, fmt.Errorf("reading detection mode: %w", err)
+		}
+		return map[string]interface{}{"detection_mode": detectionMode}, nil
 	default:
-		return nil, fmt.Errorf("unknown command %q; supported: set_mode, get_mode", command)
+		return nil, fmt.Errorf("unknown command %q; supported: set_mode, get_mode, set_detection_mode, get_detection_mode", command)
 	}
 }
 

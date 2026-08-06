@@ -19,12 +19,6 @@
     },
     {
       "api": "rdk:component:camera",
-      "model": "katie-viam:oreo-watcher:waveform-cam",
-      "short_description": "Camera that renders audio waveform images from a filtered-mic component",
-      "markdown_link": "README.md#model-katie-viamoreo-watcherwaveform-cam"
-    },
-    {
-      "api": "rdk:component:camera",
       "model": "katie-viam:oreo-watcher:spectrogram-cam",
       "short_description": "Camera that renders log-mel spectrogram images from a filtered-mic component",
       "markdown_link": "README.md#model-katie-viamoreo-watcherspectrogram-cam"
@@ -40,6 +34,12 @@
       "model": "katie-viam:oreo-watcher:mode-controller",
       "short_description": "Sensor that holds the operating mode (away, away_lite, home) and exposes set_mode/get_mode commands",
       "markdown_link": "README.md#model-katie-viamoreo-watchermode-controller"
+    },
+    {
+      "api": "rdk:component:sensor",
+      "model": "katie-viam:oreo-watcher:learning-mode",
+      "short_description": "Zero-training bark classifier using YAMNet; tags and uploads audio/spectrogram pairs for review, never plays sounds",
+      "markdown_link": "README.md#model-katie-viamoreo-watcherlearning-mode"
     },
     {
       "api": "rdk:component:sensor",
