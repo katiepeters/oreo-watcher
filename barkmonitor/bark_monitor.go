@@ -125,6 +125,14 @@ type completedSession struct {
 	Warn2Fired        bool
 	SecsAfterLastWarn float64 // seconds from last warning to session end; small = warning was effective
 	ClassifyErrors    int     // classification failures during the session
+	// WarningSound is which sound the session's warnings played: a
+	// warningClips name, "custom" for a configured override file, or
+	// "fallback" if the picked clip couldn't be produced.
+	WarningSound string
+	// Warn1/Warn2ClipOffsetSec are where in the clip each warning's section
+	// started, so effectiveness can also be compared across parts of a clip.
+	Warn1ClipOffsetSec float64
+	Warn2ClipOffsetSec float64
 }
 
 type barkMonitor struct {
@@ -180,6 +188,13 @@ type barkMonitor struct {
 	// dynamically. Not cleared on session end, so onGoodJob (which fires
 	// shortly after) still has the right names to speak.
 	sessionDogs []string
+	// sessionWarnClip is the rotation clip picked at session start; both
+	// warnings in the session play a section of it. warningSound and the
+	// offsets record what actually played, for the session reading.
+	sessionWarnClip    warningClip
+	warningSound       string
+	warn1ClipOffsetSec float64
+	warn2ClipOffsetSec float64
 
 	// Continuous recording state (nil when not in a session).
 	recordCancel   context.CancelFunc
@@ -501,7 +516,7 @@ func (b *barkMonitor) Readings(ctx context.Context, extra map[string]interface{}
 }
 
 func sessionReading(s *completedSession) map[string]interface{} {
-	return map[string]interface{}{
+	r := map[string]interface{}{
 		"start_time":           s.Start.Format(time.RFC3339Nano),
 		"end_time":             s.End.Format(time.RFC3339Nano),
 		"duration_s":           math.Round(s.End.Sub(s.Start).Seconds()*10) / 10,
@@ -512,7 +527,15 @@ func sessionReading(s *completedSession) map[string]interface{} {
 		"warn2_fired":          s.Warn2Fired,
 		"secs_after_last_warn": math.Round(s.SecsAfterLastWarn*10) / 10,
 		"classify_errors":      s.ClassifyErrors,
+		"warning_sound":        s.WarningSound,
 	}
+	if s.Warn1Fired {
+		r["warn1_clip_offset_s"] = math.Round(s.Warn1ClipOffsetSec*10) / 10
+	}
+	if s.Warn2Fired {
+		r["warn2_clip_offset_s"] = math.Round(s.Warn2ClipOffsetSec*10) / 10
+	}
+	return r
 }
 
 // uploadCandidate renders a spectrogram from capture (the same underlying
@@ -605,6 +628,12 @@ func (b *barkMonitor) onBarkDetected(db float64, barkStart time.Time, detectedDo
 		b.warn1Played = true
 		b.warn2Played = false
 		b.classifyErrors = 0
+		clip := pickWarningClip()
+		b.sessionWarnClip = clip
+		b.warningSound = ""
+		b.warn1ClipOffsetSec = 0
+		b.warn2ClipOffsetSec = 0
+		sessionStart := b.sessionStart
 		b.startRecording()
 
 		b.endTimer = time.AfterFunc(b.gapDur/2, b.onSessionEnd)
@@ -617,8 +646,15 @@ func (b *barkMonitor) onBarkDetected(db float64, barkStart time.Time, detectedDo
 			b.goodJobCancel = nil
 		}
 		go func() {
-			sound := b.warnSoundFor(detectedDogs)
-			b.playSound(context.Background(), sound)
+			w := b.prepareWarning(detectedDogs, clip)
+			b.mu.Lock()
+			if b.inSession && b.sessionStart.Equal(sessionStart) {
+				b.warningSound = w.label
+				b.warn1ClipOffsetSec = w.offsetSec
+			}
+			b.mu.Unlock()
+			b.logger.Infow("warning 1 sound", "sound", w.label, "clip_offset_s", w.offsetSec)
+			b.playPCM(context.Background(), w.pcm, w.info)
 			b.mu.Lock()
 			defer b.mu.Unlock()
 			if b.inSession {
@@ -664,9 +700,17 @@ func (b *barkMonitor) onSecondWarn() {
 	b.lastWarnTime = time.Now()
 	b.logger.Infof("bark session warning 2 emitted (%.0fs elapsed)", time.Since(b.sessionStart).Seconds())
 	dogs := b.sessionDogs // snapshot while holding b.mu; slice header copy is safe to read after unlock
+	clip := b.sessionWarnClip
+	sessionStart := b.sessionStart
 	go func() {
-		sound := b.warnSoundFor(dogs)
-		b.playSound(context.Background(), sound)
+		w := b.prepareWarning(dogs, clip)
+		b.mu.Lock()
+		if b.inSession && b.sessionStart.Equal(sessionStart) {
+			b.warn2ClipOffsetSec = w.offsetSec
+		}
+		b.mu.Unlock()
+		b.logger.Infow("warning 2 sound", "sound", w.label, "clip_offset_s", w.offsetSec)
+		b.playPCM(context.Background(), w.pcm, w.info)
 		b.mu.Lock()
 		defer b.mu.Unlock()
 		if b.inSession {
@@ -718,6 +762,10 @@ func (b *barkMonitor) onSessionEnd() {
 		Warn2Fired:        b.warn2Played,
 		SecsAfterLastWarn: endTime.Sub(b.lastWarnTime).Seconds(),
 		ClassifyErrors:    b.classifyErrors,
+
+		WarningSound:       b.warningSound,
+		Warn1ClipOffsetSec: b.warn1ClipOffsetSec,
+		Warn2ClipOffsetSec: b.warn2ClipOffsetSec,
 	}
 
 	// Stop the continuous recorder after clipPad seconds of post-roll.
@@ -962,22 +1010,63 @@ func (b *barkMonitor) synthesizeOrFallback(text string, fallback []byte) []byte 
 	return sound
 }
 
-// warnSoundFor returns the sound to play when a bark session starts, for the
-// given detected dog(s). Preference order: a configured per-dog static file
-// (only when exactly one dog was identified — a single static clip can't
-// represent multiple dogs barking together), then a configured generic
-// default file, then dynamic TTS naming the detected dog(s), then the
-// embedded static WAV as the last resort if TTS itself fails.
-func (b *barkMonitor) warnSoundFor(detectedDogs []string) []byte {
+// preparedWarning is a decoded warning ready to play, plus what to record
+// about it in the session reading.
+type preparedWarning struct {
+	pcm       []byte
+	info      *rutils.AudioInfo
+	label     string  // recorded as warning_sound: a clip name, "custom", or "fallback"
+	offsetSec float64 // where in the clip this section starts; 0 for anything but MP3 clips
+}
+
+// prepareWarning resolves the sound to play for a session warning.
+// Preference order: a configured per-dog static file (only when exactly one
+// dog was identified — a single static clip can't represent multiple dogs
+// barking together), then a configured generic default file, then the
+// session's rotation clip (a random section of an MP3, or the spoken
+// "<dog>, bark detected" line), then a "fallback" of TTS / the embedded WAV
+// if the rotation clip couldn't be produced.
+func (b *barkMonitor) prepareWarning(detectedDogs []string, clip warningClip) preparedWarning {
+	var custom []byte
 	if len(detectedDogs) == 1 {
-		if snd, ok := b.dogWarnSounds[detectedDogs[0]]; ok {
-			return snd
+		custom = b.dogWarnSounds[detectedDogs[0]]
+	}
+	if custom == nil {
+		custom = b.defaultWarnSound
+	}
+	if custom != nil {
+		if pcm, info, err := wavToPCM(custom); err == nil {
+			return preparedWarning{pcm: pcm, info: info, label: "custom"}
+		} else {
+			b.logger.Warnw("failed to parse configured warning WAV, falling back to rotation", "error", err)
 		}
 	}
-	if b.defaultWarnSound != nil {
-		return b.defaultWarnSound
+
+	switch {
+	case clip.tts:
+		wav, err := synthesizeSpeech(barkDetectedPhrase(detectedDogs))
+		if err == nil {
+			var pcm []byte
+			var info *rutils.AudioInfo
+			if pcm, info, err = wavToPCM(wav); err == nil {
+				return preparedWarning{pcm: pcm, info: info, label: clip.name}
+			}
+		}
+		b.logger.Warnw("failed to synthesize warning voice line, using fallback", "clip", clip.name, "error", err)
+	case clip.mp3 != nil:
+		pcm, info, offset, err := clip.segment(maxWarningClipDur)
+		if err == nil {
+			return preparedWarning{pcm: pcm, info: info, label: clip.name, offsetSec: offset}
+		}
+		b.logger.Warnw("failed to decode warning clip, using fallback", "clip", clip.name, "error", err)
 	}
-	return b.synthesizeOrFallback(barkDetectedPhrase(detectedDogs), leaveItSound)
+
+	wav := b.synthesizeOrFallback(barkDetectedPhrase(detectedDogs), leaveItSound)
+	pcm, info, err := wavToPCM(wav)
+	if err != nil {
+		b.logger.Warnw("failed to parse fallback warning WAV", "error", err)
+	}
+	return preparedWarning{pcm: pcm, info: info, label: "fallback"}
 }
 
 // goodJobSoundFor is warnSoundFor's counterpart for the session-end sound.
@@ -1000,19 +1089,29 @@ func (b *barkMonitor) playSound(ctx context.Context, wav []byte) {
 		b.logger.Warnw("playSound called with empty audio data")
 		return
 	}
+	pcm, info, err := wavToPCM(wav)
+	if err != nil {
+		b.logger.Warnw("failed to parse WAV for playback", "error", err)
+		return
+	}
+	b.playPCM(ctx, pcm, info)
+}
+
+// playPCM plays raw PCM via the configured speaker component. Blocks until playback completes.
+// Must NOT be called with b.mu held — callers should launch a goroutine.
+func (b *barkMonitor) playPCM(ctx context.Context, pcm []byte, info *rutils.AudioInfo) {
+	if len(pcm) == 0 || info == nil {
+		b.logger.Warnw("playPCM called with empty audio data")
+		return
+	}
 	if b.speaker == nil {
-		b.logger.Warnw("playSound: no speaker component configured")
+		b.logger.Warnw("playPCM: no speaker component configured")
 		return
 	}
 	select {
 	case <-b.closed:
 		return
 	default:
-	}
-	pcm, info, err := wavToPCM(wav)
-	if err != nil {
-		b.logger.Warnw("failed to parse WAV for playback", "error", err)
-		return
 	}
 	// Mute the mic for the duration of playback plus a cooldown so it doesn't
 	// pick up this sound through speaker/room bleed and misclassify it as a
@@ -1068,20 +1167,26 @@ func wavToPCM(wav []byte) ([]byte, *rutils.AudioInfo, error) {
 // DoCommand supports manual testing of sounds via the Viam control panel or API.
 // Supported commands:
 //
-//	{"command": "play_bark_detected"} — play the warning line
+//	{"command": "play_bark_detected"} — play a random warning clip section
+//	{"command": "play_bark_detected", "sound": "bugle"} — play a section of a specific clip
 //	{"command": "play_barking_stopped"} — play the session-end line
 func (b *barkMonitor) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
 	command, _ := cmd["command"].(string)
 	switch command {
 	case "play_bark_detected":
+		clip := pickWarningClip()
+		if name, _ := cmd["sound"].(string); name != "" {
+			var ok bool
+			if clip, ok = warningClipByName(name); !ok {
+				return nil, fmt.Errorf("unknown sound %q; available: %v", name, warningClipNames())
+			}
+		}
 		b.mu.Lock()
 		dogs := b.sessionDogs
 		b.mu.Unlock()
-		go func() {
-			sound := b.warnSoundFor(dogs)
-			b.playSound(context.Background(), sound)
-		}()
-		return map[string]interface{}{"ok": true}, nil
+		w := b.prepareWarning(dogs, clip)
+		go b.playPCM(context.Background(), w.pcm, w.info)
+		return map[string]interface{}{"ok": true, "sound": w.label, "clip_offset_s": math.Round(w.offsetSec*10) / 10}, nil
 	case "play_barking_stopped":
 		b.mu.Lock()
 		dogs := b.sessionDogs
