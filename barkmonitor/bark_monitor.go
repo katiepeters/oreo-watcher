@@ -25,6 +25,7 @@ import (
 	rutils "go.viam.com/rdk/utils"
 
 	filteredmic "github.com/katie-viam/oreo-watcher/filteredmic"
+	"github.com/katie-viam/oreo-watcher/inferencetiming"
 	"github.com/katie-viam/oreo-watcher/modestate"
 	spectrogramcam "github.com/katie-viam/oreo-watcher/spectrogramcam"
 )
@@ -437,7 +438,15 @@ func (b *barkMonitor) Readings(ctx context.Context, extra map[string]interface{}
 	// default, so an unexpected label string can't silently misfire the
 	// same way (this is exactly how "not-bark" briefly became
 	// "not-bark-bark-candidate" before this list included it).
+	classifyStart := time.Now()
 	classifications, classifyErr := b.visSvc.ClassificationsFromCamera(ctx, b.classifierCamera, 0, nil)
+	// Only record real inference calls. When spectrogram-cam has nothing new
+	// in its own capture slot, it returns ErrNoCaptureToStore immediately
+	// without ever reaching the model — timing that would just measure how
+	// fast a no-op errors out, not inference latency.
+	if classifyErr == nil {
+		inferencetiming.Record(classifyStart, time.Since(classifyStart))
+	}
 	if classifyErr == nil && len(classifications) > 0 {
 		var detectedDogs []string
 		isBark := false
@@ -449,7 +458,12 @@ func (b *barkMonitor) Readings(ctx context.Context, extra map[string]interface{}
 			case "bark":
 				isBark = true // generic single-class model; no specific dog identified
 			default:
-				detectedDogs = append(detectedDogs, c.Label())
+				// Per-dog positive labels are "<dog>-bark" (e.g. "Oreo-bark"),
+				// not a bare dog name — strip the suffix so downstream tags
+				// read "Oreo-bark-candidate", not "Oreo-bark-bark-candidate".
+				// TrimSuffix is a no-op for a model that already returns bare
+				// names, so this stays compatible with that case too.
+				detectedDogs = append(detectedDogs, strings.TrimSuffix(c.Label(), "-bark"))
 				isBark = true
 			}
 		}
