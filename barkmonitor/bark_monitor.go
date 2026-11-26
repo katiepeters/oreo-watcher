@@ -146,9 +146,15 @@ type barkMonitor struct {
 	recordingMic     audioin.AudioIn   // raw mic for continuous session recording; nil if not configured
 	speaker          audioout.AudioOut // audio_out component for playing sounds; nil if not configured
 	videoServices    []namedVideoSvc   // video services to clip during sessions
-	clipPad          time.Duration     // extra time to include before/after session in clips
-	name             resource.Name
-	logger           logging.Logger
+	// sessionCamerasAllowed records whether cameras were allowed when the
+	// current session started. A clip spans the whole session, so footage is
+	// only kept if cameras were allowed at both the start and the end.
+	sessionCamerasAllowed bool
+	// camerasAllowed is modestate.CameraCaptureAllowed outside tests.
+	camerasAllowed func() bool
+	clipPad        time.Duration // extra time to include before/after session in clips
+	name           resource.Name
+	logger         logging.Logger
 
 	// dataClient/partID feed classified spectrograms back into the same
 	// review queue Learning Mode uses (tagged <dog>-bark-candidate /
@@ -376,6 +382,7 @@ func newBarkMonitor(ctx context.Context, deps resource.Dependencies, conf resour
 		recordingMic:        recordingMic,
 		speaker:             speaker,
 		videoServices:       videoServices,
+		camerasAllowed:      modestate.CameraCaptureAllowed,
 		name:                name,
 		logger:              logger,
 		defaultWarnSound:    defaultWarnSound,
@@ -634,6 +641,7 @@ func (b *barkMonitor) onBarkDetected(db float64, barkStart time.Time, detectedDo
 		b.warn1ClipOffsetSec = 0
 		b.warn2ClipOffsetSec = 0
 		sessionStart := b.sessionStart
+		b.sessionCamerasAllowed = b.camerasAllowed()
 		b.startRecording()
 
 		b.endTimer = time.AfterFunc(b.gapDur/2, b.onSessionEnd)
@@ -780,6 +788,8 @@ func (b *barkMonitor) onSessionEnd() {
 	b.classifyErrors = 0
 	b.inSession = false
 	scheduleGoodJob := b.warn1Played
+	startedWithCameras := b.sessionCamerasAllowed
+	b.sessionCamerasAllowed = false
 
 	if b.warn2Timer != nil {
 		b.warn2Timer.Stop()
@@ -811,13 +821,15 @@ func (b *barkMonitor) onSessionEnd() {
 		// Wait for post-roll to elapse so the full clip range is recorded before requesting.
 		time.Sleep(b.clipPad)
 
+		videoServices := b.videoServicesForClip(startedWithCameras)
+
 		// Fetch video clips in parallel with the audio post-roll.
 		type videoResult struct {
 			path string
 			name string
 		}
-		videoCh := make(chan videoResult, len(b.videoServices))
-		for _, vsvc := range b.videoServices {
+		videoCh := make(chan videoResult, len(videoServices))
+		for _, vsvc := range videoServices {
 			vsvc := vsvc
 			go func() {
 				tmpPath, err := b.saveVideoClip(vsvc, clipStart, clipEnd, baseFilename, "/tmp")
@@ -858,7 +870,7 @@ func (b *barkMonitor) onSessionEnd() {
 		}
 
 		// Collect video results and mux in audio.
-		for range b.videoServices {
+		for range videoServices {
 			res := <-videoCh
 			if res.path == "" {
 				continue
@@ -1269,6 +1281,21 @@ outer:
 			}
 		}
 	}
+}
+
+// videoServicesForClip returns the video services to clip for a session that
+// is ending, or nil if cameras weren't allowed when it started or aren't
+// allowed now. Every path that fetches video must go through this.
+func (b *barkMonitor) videoServicesForClip(startedWithCameras bool) []namedVideoSvc {
+	if len(b.videoServices) == 0 {
+		return nil
+	}
+	if !startedWithCameras || !b.camerasAllowed() {
+		b.logger.Infow("cameras are off in the current operating mode; not saving video clips for this session",
+			"video_services", len(b.videoServices))
+		return nil
+	}
+	return b.videoServices
 }
 
 // saveVideoClip fetches a video clip for the session time range and writes it as an MP4 in dir.
