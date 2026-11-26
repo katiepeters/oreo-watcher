@@ -64,6 +64,12 @@
       "model": "katie-viam:oreo-watcher:sleep-monitor",
       "short_description": "Sensor that records completed sleep sessions (Oreo still on his bed)",
       "markdown_link": "README.md#model-katie-viamoreo-watchersleep-monitor"
+    },
+    {
+      "api": "rdk:component:camera",
+      "model": "katie-viam:oreo-watcher:privacy-cam",
+      "short_description": "Webcam that only opens the camera device in away mode; no frames, stream, or recording otherwise",
+      "markdown_link": "README.md#model-katie-viamoreo-watcherprivacy-cam"
     }
   ],
   "applications": null,
