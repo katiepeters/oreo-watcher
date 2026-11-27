@@ -20,9 +20,9 @@ var Model = resource.NewModel("katie-viam", "oreo-watcher", "mode-controller")
 type Mode string
 
 const (
-	ModeAway     Mode = "away"      // cameras + mic, data captured
-	ModeAwayLite Mode = "away_lite" // mic only, data captured
-	ModeHome     Mode = "home"      // bark warnings only, no data captured
+	ModeAway     Mode = modestate.OperatingModeAway     // cameras on; camera and audio data captured
+	ModeAwayLite Mode = modestate.OperatingModeAwayLite // cameras off; audio data still captured
+	ModeHome     Mode = modestate.OperatingModeHome     // cameras off; bark warnings, audio and spectrograms still captured
 )
 
 // SpokenName is how the mode is announced aloud, e.g. "away lite mode".
@@ -56,7 +56,7 @@ type ComponentCapture struct {
 // Config holds the component configuration.
 type Config struct {
 	// CameraComponents lists camera components whose GetImages capture is disabled
-	// in away_lite and home modes (e.g. cam, real-sense-cam with method "GetImages").
+	// in every mode except away (e.g. cam, real-sense-cam with method "GetImages").
 	CameraComponents []ComponentCapture `json:"camera_components"`
 	// ControlKey is the key used in Readings for the capture control array.
 	// Must match capture_control_sensor.key in the data manager config. Defaults to "controls".
@@ -122,7 +122,7 @@ func disabledHz() *float32 { v := float32(0); return &v }
 // capture_control_sensor. The data manager polls this every 100ms and applies
 // the returned overrides to each resource/method pair.
 //
-// Camera components are disabled in away_lite and home modes.
+// Camera components are disabled in every mode except away.
 func (m *modeController) Readings(ctx context.Context, extra map[string]interface{}) (map[string]interface{}, error) {
 	m.mu.RLock()
 	mode := m.mode
@@ -135,7 +135,7 @@ func (m *modeController) Readings(ctx context.Context, extra map[string]interfac
 			method = "Readings"
 		}
 		e := captureEntry{ResourceName: c.Name, Method: method}
-		if mode == ModeAwayLite || mode == ModeHome {
+		if !modestate.CamerasAllowedIn(string(mode)) {
 			e.FreqHz = disabledHz()
 		}
 		entries = append(entries, e)

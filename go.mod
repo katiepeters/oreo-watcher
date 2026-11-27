@@ -49,6 +49,7 @@ require (
 	github.com/benbjohnson/clock v1.3.5 // indirect
 	github.com/bep/debounce v1.2.1 // indirect
 	github.com/bgentry/go-netrc v0.0.0-20140422174119-9fd32a8b3d3d // indirect
+	github.com/blackjack/webcam v0.6.1 // indirect
 	github.com/bluenviron/gortsplib/v4 v4.8.0 // indirect
 	github.com/bufbuild/protocompile v0.9.0 // indirect
 	github.com/campoy/embedmd v1.0.0 // indirect
@@ -213,4 +214,6 @@ require (
 	gorgonia.org/vecf32 v0.9.0 // indirect
 	gorgonia.org/vecf64 v0.9.0 // indirect
 	nhooyr.io/websocket v1.8.7 // indirect
+	periph.io/x/conn/v3 v3.7.0 // indirect
+	periph.io/x/host/v3 v3.8.1-0.20230331112814-9f0d9f7d76db // indirect
 )
