@@ -37,6 +37,12 @@
     },
     {
       "api": "rdk:component:sensor",
+      "model": "katie-viam:oreo-watcher:mode-button",
+      "short_description": "Shelly BLU RC Button 4 remote: buttons 1-3 select home/away_lite/away, button 4 speaks the mode",
+      "markdown_link": "README.md#model-katie-viamoreo-watchermode-button"
+    },
+    {
+      "api": "rdk:component:sensor",
       "model": "katie-viam:oreo-watcher:learning-mode",
       "short_description": "Zero-training bark classifier using YAMNet; tags and uploads audio/spectrogram pairs for review, never plays sounds",
       "markdown_link": "README.md#model-katie-viamoreo-watcherlearning-mode"

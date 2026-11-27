@@ -49,6 +49,65 @@ If your model implements DoCommand, provide an example payload of each command t
 }
 ```
 
+## Model katie-viam:oreo-watcher:mode-button
+
+Sensor that lets a Shelly BLU RC Button 4 remote (including the ZB models, e.g. `SBBT-104CUS`) select the operating mode. After a mode is selected, the speaker says which mode is now active.
+
+| Button | Action                                  |
+|--------|-----------------------------------------|
+| 1      | Switch to `home`, then say "home mode"            |
+| 2      | Switch to `away_lite`, then say "away lite mode"  |
+| 3      | Switch to `away`, then say "away mode"            |
+| 4      | Say the current mode without changing it          |
+
+A single, double, or triple press all count as a press. Long presses and holds are ignored. The mode is only spoken once `mode-controller` has accepted and persisted it, so hearing the announcement means the switch happened.
+
+The remote is heard over Bluetooth: every press is broadcast as a BTHome advertisement, which this component picks up through BlueZ. The remote needs no pairing and the machine needs no Zigbee radio, but it does need a Bluetooth adapter and BlueZ (Linux only), and the remote must be within Bluetooth range. The remote's BTHome encryption must be left off (the factory default).
+
+### Configuration
+
+```json
+{
+  "mac_address": "AA:BB:CC:DD:EE:FF",
+  "mode_controller": "mode-controller",
+  "bark_monitor": "bark-monitor"
+}
+```
+
+#### Attributes
+
+| Name              | Type   | Inclusion | Description |
+|-------------------|--------|-----------|-------------|
+| `mode_controller` | string | Required  | Name of the `mode-controller` sensor to drive |
+| `bark_monitor`    | string | Required  | Name of the `bark-monitor` sensor; its `speaker` makes the announcements (and it mutes the mic while speaking) |
+| `mac_address`     | string | Optional  | The remote's Bluetooth address. Presses are ignored until this is set — see below |
+| `adapter`         | string | Optional  | BlueZ adapter to listen on. Defaults to `hci0` |
+
+#### Finding the remote's address
+
+Leave `mac_address` out, press any button on the remote, and read the address from the `discovered_remotes` reading (or the component's logs). Copy it into `mac_address`. Presses only take effect from the one configured remote.
+
+### Readings
+
+| Key                  | Type     | Description |
+|----------------------|----------|-------------|
+| `mac_address`        | string   | The configured remote, or `""` |
+| `battery_percent`    | int      | Remote battery level, once it has been heard |
+| `last_button`        | int      | Most recent button pressed on the remote (1-4) |
+| `last_press_at`      | string   | RFC3339 time of that press |
+| `bluetooth_error`    | string   | Present only while Bluetooth listening is failing (it retries every 10s) |
+| `discovered_remotes` | string[] | Present only while `mac_address` is unset: addresses of button remotes heard |
+
+### DoCommand
+
+Simulate a press, e.g. to test the announcement without the remote in hand:
+
+```json
+{"command": "press", "button": 3}
+```
+
+Returns `{"mode": "away"}` after the announcement finishes, or an error if the mode could not be set or spoken.
+
 ## Model katie-viam:oreo-watcher:inference-monitor
 
 Sensor that reports how long each `bark-monitor` spectrogram classification call took. `bark-monitor` records the duration of every real classification it runs (calls where `spectrogram-cam` actually had a new capture to classify — calls that error out immediately because there was nothing new are not counted); this sensor drains those recorded samples on each poll and returns each as its own object, so no individual call's timing is lost even if this sensor is polled less often than classifications happen.

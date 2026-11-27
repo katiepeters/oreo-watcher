@@ -1070,6 +1070,7 @@ func wavToPCM(wav []byte) ([]byte, *rutils.AudioInfo, error) {
 //
 //	{"command": "play_bark_detected"} — play the warning line
 //	{"command": "play_barking_stopped"} — play the session-end line
+//	{"command": "say", "text": "..."} — speak text; returns once playback finishes
 func (b *barkMonitor) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
 	command, _ := cmd["command"].(string)
 	switch command {
@@ -1091,8 +1092,22 @@ func (b *barkMonitor) DoCommand(ctx context.Context, cmd map[string]interface{})
 			b.playSound(context.Background(), sound)
 		}()
 		return map[string]interface{}{"ok": true}, nil
+	case "say":
+		text, _ := cmd["text"].(string)
+		if text == "" {
+			return nil, fmt.Errorf("say requires a non-empty \"text\"")
+		}
+		if b.speaker == nil {
+			return nil, fmt.Errorf("say: no speaker component configured")
+		}
+		wav, err := synthesizeSpeech(text)
+		if err != nil {
+			return nil, fmt.Errorf("synthesizing speech: %w", err)
+		}
+		b.playSound(ctx, wav)
+		return map[string]interface{}{"ok": true}, nil
 	default:
-		return nil, fmt.Errorf("unknown command %q; supported: play_bark_detected, play_barking_stopped", command)
+		return nil, fmt.Errorf("unknown command %q; supported: play_bark_detected, play_barking_stopped, say", command)
 	}
 }
 
