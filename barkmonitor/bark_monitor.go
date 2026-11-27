@@ -269,6 +269,9 @@ func newBarkMonitor(ctx context.Context, deps resource.Dependencies, conf resour
 		if !ok {
 			return nil, fmt.Errorf("dependency %q is not an audio_out component", cfg.Speaker)
 		}
+		if _, err := ttsBinary(); err != nil {
+			logger.Errorw("no text-to-speech engine on this machine: spoken lines will fall back to static sounds or fail. Run 'sudo apt-get install -y espeak-ng' to fix.", "error", err)
+		}
 	}
 
 	var videoServices []namedVideoSvc
@@ -971,7 +974,7 @@ func barkingStoppedPhrase(detectedDogs []string) string {
 }
 
 // ttsBinary locates whichever TTS engine is actually installed on this
-// device — espeak-ng (the actively maintained fork, and what setup.sh
+// device — espeak-ng (the actively maintained fork, and what first_run.sh
 // installs) doesn't always provide an "espeak"-named binary, so both names
 // are tried rather than assuming one.
 func ttsBinary() (string, error) {
@@ -984,7 +987,7 @@ func ttsBinary() (string, error) {
 }
 
 // synthesizeSpeech renders text to WAV bytes using the device's espeak/espeak-ng
-// binary (installed by setup.sh). Requires one to be present.
+// binary (installed by first_run.sh). Requires one to be present.
 func synthesizeSpeech(text string) ([]byte, error) {
 	bin, err := ttsBinary()
 	if err != nil {
