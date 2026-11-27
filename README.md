@@ -55,12 +55,12 @@ Sensor that lets a Shelly BLU RC Button 4 remote (including the ZB models, e.g. 
 
 | Button | Action                                  |
 |--------|-----------------------------------------|
-| 1      | Switch to `home`, then say "home mode"            |
-| 2      | Switch to `away_lite`, then say "away lite mode"  |
-| 3      | Switch to `away`, then say "away mode"            |
-| 4      | Say the current mode without changing it          |
+| 1      | Switch to `home`, then say "Switched to home mode"            |
+| 2      | Switch to `away_lite`, then say "Switched to away lite mode"  |
+| 3      | Switch to `away`, then say "Switched to away mode"            |
+| 4      | Say "Currently in ... mode" without changing it               |
 
-A single, double, or triple press all count as a press. Long presses and holds are ignored. The mode is only spoken once `mode-controller` has accepted and persisted it, so hearing the announcement means the switch happened.
+A single, double, or triple press all count as a press. Long presses and holds are ignored. The mode is only spoken once `mode-controller` has accepted and persisted it, so hearing the announcement means the switch happened. Each announcement is preceded by a short two-note chime, which keeps the speaker from swallowing the first word as it wakes up.
 
 The remote is heard over Bluetooth: every press is broadcast as a BTHome advertisement, which this component picks up through BlueZ. The remote needs no pairing and the machine needs no Zigbee radio, but it does need a Bluetooth adapter and BlueZ (Linux only), and the remote must be within Bluetooth range. The remote's BTHome encryption must be left off (the factory default).
 
@@ -82,6 +82,7 @@ The remote is heard over Bluetooth: every press is broadcast as a BTHome adverti
 | `bark_monitor`    | string | Required  | Name of the `bark-monitor` sensor; its `speaker` makes the announcements (and it mutes the mic while speaking) |
 | `mac_address`     | string | Optional  | The remote's Bluetooth address. Presses are ignored until this is set — see below |
 | `adapter`         | string | Optional  | BlueZ adapter to listen on. Defaults to `hci0` |
+| `announcement_volume` | float | Optional | How loudly the mode is announced, above 0 and at most 1. Defaults to 1 (the speaker's own volume). Affects only these announcements, not bark warnings |
 
 #### Finding the remote's address
 

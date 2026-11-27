@@ -990,10 +990,6 @@ func ttsBinary() (string, error) {
 // default of 175 so short phrases are easier to catch.
 const ttsWordsPerMinute = "150"
 
-// ttsVoice is the espeak voice: US English with the "f3" variant, which is
-// higher and softer than the flat default.
-const ttsVoice = "en-us+f3"
-
 // synthesizeSpeech renders text to WAV bytes using the device's espeak/espeak-ng
 // binary (installed by first_run.sh). Requires one to be present.
 func synthesizeSpeech(text string) ([]byte, error) {
@@ -1010,7 +1006,7 @@ func synthesizeSpeech(text string) ([]byte, error) {
 	tmpFile.Close()
 	defer os.Remove(tmpPath)
 
-	cmd := exec.Command(bin, "-v", ttsVoice, "-s", ttsWordsPerMinute, "-w", tmpPath, text)
+	cmd := exec.Command(bin, "-s", ttsWordsPerMinute, "-w", tmpPath, text)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("%s: %w\n%s", bin, err, out)
 	}
@@ -1117,37 +1113,7 @@ func (b *barkMonitor) playSound(ctx context.Context, wav []byte) {
 		b.logger.Warnw("failed to parse WAV for playback", "error", err)
 		return
 	}
-	b.playPCM(ctx, withLeadIn(pcm, info, playbackLeadIn), info)
-}
-
-// playbackLeadIn is how long a near-silent signal plays ahead of a sound. The
-// speaker takes a moment to start producing audio after being idle, which
-// otherwise swallows the first syllable of a spoken line.
-const playbackLeadIn = 500 * time.Millisecond
-
-// leadInAmplitude is the sample value of the lead-in signal, about 72dB below
-// full scale. It is inaudible, but unlike digital silence it keeps a speaker
-// that sleeps on silence awake.
-const leadInAmplitude = 8
-
-// withLeadIn returns pcm (16-bit samples) preceded by dur of lead-in signal.
-func withLeadIn(pcm []byte, info *rutils.AudioInfo, dur time.Duration) []byte {
-	if info == nil || info.SampleRateHz <= 0 || info.NumChannels <= 0 {
-		return pcm
-	}
-	frames := int(dur * time.Duration(info.SampleRateHz) / time.Second)
-	channels := int(info.NumChannels)
-	out := make([]byte, frames*channels*2, frames*channels*2+len(pcm))
-	for frame := 0; frame < frames; frame++ {
-		sample := int16(leadInAmplitude)
-		if frame%2 == 1 {
-			sample = -leadInAmplitude
-		}
-		for ch := 0; ch < channels; ch++ {
-			binary.LittleEndian.PutUint16(out[(frame*channels+ch)*2:], uint16(sample))
-		}
-	}
-	return append(out, pcm...)
+	b.playPCM(ctx, pcm, info)
 }
 
 // playPCM plays raw PCM via the configured speaker component. Blocks until playback completes.
@@ -1223,7 +1189,7 @@ func wavToPCM(wav []byte) ([]byte, *rutils.AudioInfo, error) {
 //	{"command": "play_bark_detected"} — play a random warning clip section
 //	{"command": "play_bark_detected", "sound": "bugle"} — play a section of a specific clip
 //	{"command": "play_barking_stopped"} — play the session-end line
-//	{"command": "say", "text": "..."} — speak text; returns once playback finishes
+//	{"command": "say", "text": "...", "volume": 0.5} — play a chime, then speak text; volume (0-1] is optional; returns once playback finishes
 func (b *barkMonitor) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
 	command, _ := cmd["command"].(string)
 	switch command {
@@ -1258,11 +1224,22 @@ func (b *barkMonitor) DoCommand(ctx context.Context, cmd map[string]interface{})
 		if b.speaker == nil {
 			return nil, fmt.Errorf("say: no speaker component configured")
 		}
+		volume := 1.0
+		if v, given := cmd["volume"]; given {
+			var ok bool
+			if volume, ok = v.(float64); !ok || volume <= 0 || volume > 1 {
+				return nil, fmt.Errorf("say: volume must be a number above 0 and at most 1, got %v", v)
+			}
+		}
 		wav, err := synthesizeSpeech(text)
 		if err != nil {
 			return nil, fmt.Errorf("synthesizing speech: %w", err)
 		}
-		b.playSound(ctx, wav)
+		pcm, info, err := wavToPCM(wav)
+		if err != nil {
+			return nil, fmt.Errorf("reading synthesized speech: %w", err)
+		}
+		b.playPCM(ctx, announcement(pcm, info, volume), info)
 		return map[string]interface{}{"ok": true}, nil
 	default:
 		return nil, fmt.Errorf("unknown command %q; supported: play_bark_detected, play_barking_stopped, say", command)

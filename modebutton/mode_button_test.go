@@ -49,6 +49,7 @@ func (f *fakeModeCtrl) current() string {
 // fakeSpeaker records what bark-monitor's say command was asked to speak.
 type fakeSpeaker struct {
 	spoken chan string
+	volume float64 // volume of the most recent say
 	err    error
 }
 
@@ -59,6 +60,7 @@ func (f *fakeSpeaker) DoCommand(_ context.Context, cmd map[string]interface{}) (
 	if f.err != nil {
 		return nil, f.err
 	}
+	f.volume = cmd["volume"].(float64)
 	f.spoken <- cmd["text"].(string)
 	return map[string]interface{}{"ok": true}, nil
 }
@@ -129,7 +131,7 @@ func (h *harness) expectSpoken(t *testing.T, want string) {
 func (h *harness) expectSilence(t *testing.T, nextPacketID byte) {
 	t.Helper()
 	h.send(remoteAddr, payload(nextPacketID, 4, bthome.ButtonPress))
-	h.expectSpoken(t, h.ctrl.current()+" mode")
+	h.expectSpoken(t, "Currently in "+h.ctrl.current()+" mode")
 }
 
 func TestButtonsSelectAndAnnounceModes(t *testing.T) {
@@ -140,11 +142,11 @@ func TestButtonsSelectAndAnnounceModes(t *testing.T) {
 		wantMode string
 		wantSay  string
 	}{
-		{3, bthome.ButtonPress, "away", "away mode"},
-		{2, bthome.ButtonPress, "away_lite", "away lite mode"},
-		{4, bthome.ButtonPress, "away_lite", "away lite mode"},
-		{1, bthome.ButtonDoublePress, "home", "home mode"},
-		{4, bthome.ButtonTriplePress, "home", "home mode"},
+		{3, bthome.ButtonPress, "away", "Switched to away mode"},
+		{2, bthome.ButtonPress, "away_lite", "Switched to away lite mode"},
+		{4, bthome.ButtonPress, "away_lite", "Currently in away lite mode"},
+		{1, bthome.ButtonDoublePress, "home", "Switched to home mode"},
+		{4, bthome.ButtonTriplePress, "home", "Currently in home mode"},
 	} {
 		h.send(remoteAddr, payload(byte(i), tc.button, tc.event))
 		h.expectSpoken(t, tc.wantSay)
@@ -161,7 +163,7 @@ func TestAdvertsThatMustNotChangeTheMode(t *testing.T) {
 	}{
 		{"rebroadcast of an already-handled press", func(h *harness) {
 			h.send(remoteAddr, payload(1, 1, bthome.ButtonPress))
-			h.expectSpoken(t, "home mode")
+			h.expectSpoken(t, "Switched to home mode")
 			h.send(remoteAddr, payload(1, 1, bthome.ButtonPress))
 			h.ctrl.mu.Lock()
 			h.ctrl.mode = "away"
@@ -207,7 +209,7 @@ func TestCachedAdvertDoesNotSwallowTheNextPress(t *testing.T) {
 	h := newHarness(t, remoteAddr)
 	h.adverts <- advert{address: remoteAddr, data: payload(9, 3, bthome.ButtonPress), cached: true}
 	h.send(remoteAddr, payload(10, 3, bthome.ButtonPress))
-	h.expectSpoken(t, "away mode")
+	h.expectSpoken(t, "Switched to away mode")
 }
 
 func TestModeIsNotAnnouncedWhenSettingItFails(t *testing.T) {
@@ -249,7 +251,7 @@ func TestWithoutMACAddressPressesAreReportedNotActedOn(t *testing.T) {
 func TestReadingsAfterPress(t *testing.T) {
 	h := newHarness(t, remoteAddr)
 	h.send(remoteAddr, payload(1, 2, bthome.ButtonPress))
-	h.expectSpoken(t, "away lite mode")
+	h.expectSpoken(t, "Switched to away lite mode")
 	readings, err := h.mb.Readings(context.Background(), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -268,7 +270,7 @@ func TestPressCommand(t *testing.T) {
 	if resp["mode"] != "away" {
 		t.Fatalf("resp = %v, want mode away", resp)
 	}
-	h.expectSpoken(t, "away mode")
+	h.expectSpoken(t, "Switched to away mode")
 
 	h.speaker.err = errors.New("no speaker")
 	if _, err := h.mb.DoCommand(context.Background(), map[string]interface{}{"command": "press", "button": float64(1)}); err == nil {
@@ -290,6 +292,9 @@ func TestConfigValidate(t *testing.T) {
 		{"malformed address", Config{MACAddress: "nope", ModeController: "mc", BarkMonitor: "bm"}, true},
 		{"missing mode_controller", Config{BarkMonitor: "bm"}, true},
 		{"missing bark_monitor", Config{ModeController: "mc"}, true},
+		{"quieter announcements", Config{ModeController: "mc", BarkMonitor: "bm", AnnouncementVolume: ptr(0.4)}, false},
+		{"zero volume", Config{ModeController: "mc", BarkMonitor: "bm", AnnouncementVolume: ptr(0.0)}, true},
+		{"volume above 1", Config{ModeController: "mc", BarkMonitor: "bm", AnnouncementVolume: ptr(1.5)}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			deps, _, err := tc.cfg.Validate("")
@@ -375,5 +380,19 @@ func waitForReading(t *testing.T, mb *modeButton, key string, want interface{}) 
 			t.Fatalf("%s = %v, want %v", key, readings[key], want)
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+func ptr(v float64) *float64 { return &v }
+
+func TestAnnouncementVolumeIsPassedToTheSpeaker(t *testing.T) {
+	h := newHarness(t, remoteAddr)
+	h.mb.volume = 0.4
+	if _, err := h.mb.DoCommand(context.Background(), map[string]interface{}{"command": "press", "button": float64(4)}); err != nil {
+		t.Fatal(err)
+	}
+	h.expectSpoken(t, "Currently in home mode")
+	if h.speaker.volume != 0.4 {
+		t.Fatalf("speaker asked for volume %v, want 0.4", h.speaker.volume)
 	}
 }

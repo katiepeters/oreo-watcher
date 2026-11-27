@@ -61,6 +61,9 @@ type Config struct {
 	BarkMonitor string `json:"bark_monitor"`
 	// Adapter is the BlueZ adapter to listen on. Defaults to "hci0".
 	Adapter string `json:"adapter"`
+	// AnnouncementVolume scales how loudly the mode is announced, above 0 and
+	// at most 1. Defaults to 1, the speaker's own volume.
+	AnnouncementVolume *float64 `json:"announcement_volume"`
 }
 
 // Validate ensures the config is valid and returns required dependencies.
@@ -75,6 +78,9 @@ func (c *Config) Validate(path string) ([]string, []string, error) {
 		if _, err := normalizeMAC(c.MACAddress); err != nil {
 			return nil, nil, err
 		}
+	}
+	if v := c.AnnouncementVolume; v != nil && (*v <= 0 || *v > 1) {
+		return nil, nil, fmt.Errorf("announcement_volume must be above 0 and at most 1, got %v", *v)
 	}
 	return []string{c.ModeController, c.BarkMonitor}, nil, nil
 }
@@ -101,6 +107,7 @@ type modeButton struct {
 	speaker    commander
 	presses    chan int
 	retryDelay time.Duration // wait before listening again after a failure
+	volume     float64       // announcement volume, (0, 1]
 	cancel     context.CancelFunc
 	background sync.WaitGroup
 
@@ -142,6 +149,9 @@ func newModeButton(ctx context.Context, deps resource.Dependencies, conf resourc
 	}
 
 	mb := newWithSource(conf.ResourceName(), address, modeCtrl, speaker, logger)
+	if cfg.AnnouncementVolume != nil {
+		mb.volume = *cfg.AnnouncementVolume
+	}
 	mb.start(listenBlueZ(adapter))
 	return mb, nil
 }
@@ -155,6 +165,7 @@ func newWithSource(name resource.Name, address string, modeCtrl, speaker command
 		speaker:    speaker,
 		presses:    make(chan int, buttonCount),
 		retryDelay: defaultRetryDelay,
+		volume:     1,
 		discovered: map[string]struct{}{},
 	}
 }
@@ -264,12 +275,13 @@ func (mb *modeButton) handleAdvert(a advert) {
 // press performs a button's action and returns the mode that was announced.
 // The mode is only spoken once the mode controller has accepted it.
 func (mb *modeButton) press(ctx context.Context, button int) (string, error) {
-	var mode string
+	var mode, text string
 	if target, ok := buttonModes[button]; ok {
 		mode = string(target)
 		if _, err := mb.modeCtrl.DoCommand(ctx, map[string]interface{}{"command": "set_mode", "mode": mode}); err != nil {
 			return "", fmt.Errorf("setting mode %q: %w", mode, err)
 		}
+		text = "Switched to " + target.SpokenName()
 	} else if button == announceButton {
 		resp, err := mb.modeCtrl.DoCommand(ctx, map[string]interface{}{"command": "get_mode"})
 		if err != nil {
@@ -278,12 +290,13 @@ func (mb *modeButton) press(ctx context.Context, button int) (string, error) {
 		if mode, ok = resp["mode"].(string); !ok || mode == "" {
 			return "", fmt.Errorf("mode controller returned no mode: %v", resp)
 		}
+		text = "Currently in " + modecontroller.Mode(mode).SpokenName()
 	} else {
 		return "", fmt.Errorf("unknown button %d; the remote has buttons 1-%d", button, buttonCount)
 	}
 
-	text := modecontroller.Mode(mode).SpokenName()
-	if _, err := mb.speaker.DoCommand(ctx, map[string]interface{}{"command": "say", "text": text}); err != nil {
+	say := map[string]interface{}{"command": "say", "text": text, "volume": mb.volume}
+	if _, err := mb.speaker.DoCommand(ctx, say); err != nil {
 		return mode, fmt.Errorf("mode is %q but announcing it failed: %w", mode, err)
 	}
 	return mode, nil
