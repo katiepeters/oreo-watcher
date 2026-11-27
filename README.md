@@ -105,8 +105,7 @@ The operating mode is read from the state file that `mode-controller` writes. An
 - **Entering `away`:** the device opens within about a second.
 - **Leaving `away`:** the device closes within about a second, and any `Images` call made after the change fails, even before the device has closed.
 - **While the camera is off:** `Images` and `NextPointCloud` return `camera is off: cameras are only enabled in away mode`.
-  - Callers with a deadline, such as the Viam app, the CLI and vision services, get this error immediately.
-  - Callers without a deadline, such as the video service's background frame poller, wait instead, for up to 5 minutes or until the mode changes to `away`, so they don't retry and log a warning every second.
+  - A `viam:viamrtsp:video-service` on the camera keeps polling and logs a warning for each failed poll. rdk deduplicates these to about five lines a minute per service.
 - **`Properties`** never opens the device. While the camera is off, it reports a camera with no intrinsics.
 
 ### Configuration
