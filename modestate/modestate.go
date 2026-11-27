@@ -10,13 +10,22 @@ import (
 	"sync"
 )
 
-const statePath = "/root/pupster-mode.json"
+// statePath is a var so tests can point it at a temp file.
+var statePath = "/root/pupster-mode.json"
 
 // Detection mode values, read by learningmode and bark_monitor to decide
 // whether they should be doing anything on a given poll.
 const (
 	DetectionModeLearning = "learning"
 	DetectionModeTrained  = "trained"
+)
+
+// Operating mode values. The modecontroller package re-exports these as its
+// typed Mode constants.
+const (
+	OperatingModeAway     = "away"
+	OperatingModeAwayLite = "away_lite"
+	OperatingModeHome     = "home"
 )
 
 type state struct {
@@ -84,7 +93,7 @@ func GetOperatingMode() (string, error) {
 		return "", err
 	}
 	if s.OperatingMode == "" {
-		return "home", nil
+		return OperatingModeHome, nil
 	}
 	return s.OperatingMode, nil
 }
@@ -97,4 +106,22 @@ func SetOperatingMode(mode string) error {
 	}
 	s.OperatingMode = mode
 	return write(s)
+}
+
+// CamerasAllowedIn reports whether camera imagery may be captured, stored or
+// uploaded in the given operating mode. It is an allowlist: only away mode
+// permits cameras, so home, away_lite, and any unrecognized value all deny.
+func CamerasAllowedIn(mode string) bool {
+	return mode == OperatingModeAway
+}
+
+// CameraCaptureAllowed is the single gate every code path that reads camera
+// frames or persists video must check. It reads the persisted operating mode
+// and fails closed: if the mode can't be read, cameras are treated as off.
+func CameraCaptureAllowed() bool {
+	mode, err := GetOperatingMode()
+	if err != nil {
+		return false
+	}
+	return CamerasAllowedIn(mode)
 }

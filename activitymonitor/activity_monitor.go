@@ -16,6 +16,7 @@ import (
 	"go.viam.com/rdk/services/vision"
 
 	modecontroller "github.com/katie-viam/oreo-watcher/modecontroller"
+	"github.com/katie-viam/oreo-watcher/modestate"
 )
 
 // Model is the model triple for the activity-monitor sensor component.
@@ -114,7 +115,9 @@ type activityMonitor struct {
 	cam1Name    string
 	cam2Name    string
 	modeCtrl    modecontroller.ModeController // nil if not configured
-	logger      logging.Logger
+	// persistedCamerasAllowed is modestate.CameraCaptureAllowed outside tests.
+	persistedCamerasAllowed func() bool
+	logger                  logging.Logger
 
 	minBedOverlap            float64
 	maxOreoToBedSizeRatio    float64
@@ -256,6 +259,7 @@ func newActivityMonitor(ctx context.Context, deps resource.Dependencies, conf re
 		cam1Name:                 cfg.Camera1,
 		cam2Name:                 cfg.Camera2,
 		modeCtrl:                 modeCtrl,
+		persistedCamerasAllowed:  modestate.CameraCaptureAllowed,
 		logger:                   logger,
 		minBedOverlap:            minBedOverlap,
 		maxOreoToBedSizeRatio:    maxRatio,
@@ -284,13 +288,25 @@ func (a *activityMonitor) runLoop() {
 	}
 }
 
+func (a *activityMonitor) camerasAllowed() bool {
+	if a.modeCtrl != nil && !modestate.CamerasAllowedIn(string(a.modeCtrl.Mode())) {
+		return false
+	}
+	return a.persistedCamerasAllowed()
+}
+
 func (a *activityMonitor) tick(ctx context.Context) {
-	// In away_lite and home modes, camera monitoring is disabled.
-	if a.modeCtrl != nil {
-		switch a.modeCtrl.Mode() {
-		case modecontroller.ModeAwayLite, modecontroller.ModeHome:
-			return
-		}
+	// Cameras are off outside away mode. The persisted mode is checked even
+	// when no mode_controller is configured, so leaving that dependency out
+	// can't turn camera reads back on.
+	if !a.camerasAllowed() {
+		a.mu.Lock()
+		a.referenceImg1 = nil
+		a.stillFrameCount1 = 0
+		a.referenceImg2 = nil
+		a.stillFrameCount2 = 0
+		a.mu.Unlock()
+		return
 	}
 
 	now := time.Now()

@@ -95,3 +95,65 @@ Example:
 ```
 
 If no classification calls happened since the last poll, `Readings()` returns `ErrNoCaptureToStore` and nothing is captured for that poll.
+
+## Model katie-viam:oreo-watcher:privacy-cam
+
+Webcam that only opens the camera device while the machine is in `away` mode. In `home` and `away_lite` the device is closed, so nothing on the machine can get a frame from it: not the live feed in the Viam app, not `viam:viamrtsp:video-service` recording, not vision services, and not data capture.
+
+The operating mode is read from the state file that `mode-controller` writes. Anything other than a readable `away` mode, including a missing or corrupt state file, keeps the camera off.
+
+- **Entering `away`:** the device opens within about a second.
+- **Leaving `away`:** the device closes within about a second, and any `Images` call made after the change fails, even before the device has closed.
+- **While the camera is off:** `Images` and `NextPointCloud` return `camera is off: cameras are only enabled in away mode`.
+  - A `viam:viamrtsp:video-service` on the camera keeps polling and logs a warning for each failed poll. rdk deduplicates these to about five lines a minute per service.
+- **`Properties`** never opens the device. While the camera is off, it reports a camera with no intrinsics.
+
+### Configuration
+
+`privacy-cam` takes the same attributes as `rdk:builtin:webcam`, so you can switch an existing webcam over by changing only its `model`. Use a stable path from `/dev/v4l/by-id/` or `/dev/v4l/by-path/` for `video_path`: if it is empty, the camera opens the first webcam it finds, which may be a different camera on machines with more than one.
+
+#### Attributes
+
+| Name          | Type   | Inclusion   | Description                                                  |
+|---------------|--------|-------------|--------------------------------------------------------------|
+| `video_path`  | string | Recommended | Device to open, for example a `/dev/v4l/by-id/` name           |
+| `format`      | string | Optional    | Pixel format, for example `MJPEG` or `YUYV`                   |
+| `width_px`    | int    | Optional    | Frame width                                                  |
+| `height_px`   | int    | Optional    | Frame height                                                 |
+| `frame_rate`  | float  | Optional    | Frames per second                                            |
+
+Any other `rdk:builtin:webcam` attribute, such as `intrinsic_parameters` or `distortion_parameters`, also works.
+
+#### Example Configuration
+
+```json
+{
+  "name": "cam",
+  "api": "rdk:component:camera",
+  "model": "katie-viam:oreo-watcher:privacy-cam",
+  "attributes": {
+    "video_path": "usb-EMEET_EMEET_SmartCam_C950_24082114152-video-index0",
+    "format": "MJPEG",
+    "width_px": 640,
+    "height_px": 480
+  }
+}
+```
+
+### DoCommand
+
+Any command returns whether the device is open right now. This is useful for checking the camera is really off outside `away`.
+
+```json
+{}
+```
+
+Response:
+
+```json
+{"device_open": false}
+```
+
+### Limits
+
+`privacy-cam` controls only its own device. A shell service, or another camera component configured on the same device, can still open it directly.

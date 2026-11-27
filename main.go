@@ -17,6 +17,7 @@ import (
 	learningmode "github.com/katie-viam/oreo-watcher/learningmode"
 	modecontroller "github.com/katie-viam/oreo-watcher/modecontroller"
 	movementmonitor "github.com/katie-viam/oreo-watcher/movementmonitor"
+	privacycam "github.com/katie-viam/oreo-watcher/privacycam"
 	sleepmonitor "github.com/katie-viam/oreo-watcher/sleepmonitor"
 	spectrogramcam "github.com/katie-viam/oreo-watcher/spectrogramcam"
 )
@@ -46,6 +47,10 @@ func mainWithArgs(ctx context.Context, args []string, logger logging.Logger) err
 	}
 
 	if err = myMod.AddModelFromRegistry(ctx, camera.API, spectrogramcam.Model); err != nil {
+		return err
+	}
+
+	if err = myMod.AddModelFromRegistry(ctx, camera.API, privacycam.Model); err != nil {
 		return err
 	}
 
