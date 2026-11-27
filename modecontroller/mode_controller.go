@@ -3,6 +3,7 @@ package modecontroller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 
 	"go.viam.com/rdk/components/sensor"
@@ -23,6 +24,11 @@ const (
 	ModeAwayLite Mode = modestate.OperatingModeAwayLite // cameras off; audio data still captured
 	ModeHome     Mode = modestate.OperatingModeHome     // cameras off; bark warnings, audio and spectrograms still captured
 )
+
+// SpokenName is how the mode is announced aloud, e.g. "away lite mode".
+func (m Mode) SpokenName() string {
+	return strings.ReplaceAll(string(m), "_", " ") + " mode"
+}
 
 // ModeController is the interface activity-monitor and bark-monitor use to
 // read the current operating mode.

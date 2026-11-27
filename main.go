@@ -15,6 +15,7 @@ import (
 	filteredmic "github.com/katie-viam/oreo-watcher/filteredmic"
 	inferencemonitor "github.com/katie-viam/oreo-watcher/inferencemonitor"
 	learningmode "github.com/katie-viam/oreo-watcher/learningmode"
+	modebutton "github.com/katie-viam/oreo-watcher/modebutton"
 	modecontroller "github.com/katie-viam/oreo-watcher/modecontroller"
 	movementmonitor "github.com/katie-viam/oreo-watcher/movementmonitor"
 	privacycam "github.com/katie-viam/oreo-watcher/privacycam"
@@ -67,6 +68,10 @@ func mainWithArgs(ctx context.Context, args []string, logger logging.Logger) err
 	}
 
 	if err = myMod.AddModelFromRegistry(ctx, sensor.API, modecontroller.Model); err != nil {
+		return err
+	}
+
+	if err = myMod.AddModelFromRegistry(ctx, sensor.API, modebutton.Model); err != nil {
 		return err
 	}
 

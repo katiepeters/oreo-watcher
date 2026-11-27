@@ -3,12 +3,14 @@ package barkmonitor
 import (
 	"testing"
 	"time"
+
+	"go.viam.com/rdk/logging"
 )
 
 func TestWarningClipSegments(t *testing.T) {
 	for _, clip := range warningClips {
-		if clip.tts {
-			continue // synthesized at play time; needs espeak, not an MP3 decode
+		if clip.mp3 == nil {
+			continue // short recordings play whole; nothing to segment
 		}
 		t.Run(clip.name, func(t *testing.T) {
 			for range 5 {
@@ -42,5 +44,24 @@ func TestWarningClipByName(t *testing.T) {
 	}
 	if _, ok := warningClipByName("nope"); ok {
 		t.Error("unexpected clip for unknown name")
+	}
+}
+
+// Every rotation clip must be playable as itself on a machine with no TTS
+// engine, so each session's warning_sound label names what was really heard.
+func TestEveryRotationClipPlaysAsItselfWithoutSpeech(t *testing.T) {
+	previous := piperDir
+	piperDir = t.TempDir()
+	t.Cleanup(func() { piperDir = previous })
+
+	b := &barkMonitor{logger: logging.NewTestLogger(t)}
+	for _, clip := range warningClips {
+		w := b.prepareWarning([]string{"oreo"}, clip)
+		if w.label != clip.name {
+			t.Errorf("clip %q played as %q", clip.name, w.label)
+		}
+		if pcmDuration(w.pcm, w.info) < 300*time.Millisecond {
+			t.Errorf("clip %q produced no usable audio", clip.name)
+		}
 	}
 }

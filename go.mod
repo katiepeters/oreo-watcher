@@ -4,6 +4,7 @@ go 1.25.1
 
 require (
 	github.com/fogleman/gg v1.3.0
+	github.com/godbus/dbus/v5 v5.2.4
 	github.com/hajimehoshi/go-mp3 v0.3.4
 	go.viam.com/rdk v0.126.0
 	go.viam.com/utils v0.4.19
