@@ -28,9 +28,9 @@ var Model = resource.NewModel("katie-viam", "oreo-watcher", "mode-button")
 const (
 	defaultAdapter = "hci0"
 	// announceButton speaks the current mode instead of changing it.
-	announceButton = 4
-	buttonCount    = 4
-	scanRetryDelay = 10 * time.Second
+	announceButton    = 4
+	buttonCount       = 4
+	defaultRetryDelay = 10 * time.Second
 	// repeatWindow is how long an identical advert without a packet ID is
 	// treated as a rebroadcast of the same press rather than a new one.
 	repeatWindow = 3 * time.Second
@@ -100,6 +100,7 @@ type modeButton struct {
 	modeCtrl   commander
 	speaker    commander
 	presses    chan int
+	retryDelay time.Duration // wait before listening again after a failure
 	cancel     context.CancelFunc
 	background sync.WaitGroup
 
@@ -153,6 +154,7 @@ func newWithSource(name resource.Name, address string, modeCtrl, speaker command
 		modeCtrl:   modeCtrl,
 		speaker:    speaker,
 		presses:    make(chan int, buttonCount),
+		retryDelay: defaultRetryDelay,
 		discovered: map[string]struct{}{},
 	}
 }
@@ -168,18 +170,22 @@ func (mb *modeButton) start(source advertSource) {
 	go func() {
 		defer mb.background.Done()
 		for {
-			err := source(ctx, mb.handleAdvert)
+			err := source(ctx, mb.handleAdvert, func() {
+				mb.mu.Lock()
+				mb.scanErr = nil
+				mb.mu.Unlock()
+			})
 			if ctx.Err() != nil {
 				return
 			}
 			mb.mu.Lock()
 			mb.scanErr = err
 			mb.mu.Unlock()
-			mb.logger.Errorw("bluetooth listening stopped, will retry", "error", err, "retry_in", scanRetryDelay)
+			mb.logger.Errorw("bluetooth listening stopped, will retry", "error", err, "retry_in", mb.retryDelay)
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(scanRetryDelay):
+			case <-time.After(mb.retryDelay):
 			}
 		}
 	}()
@@ -204,7 +210,6 @@ func (mb *modeButton) handleAdvert(a advert) {
 
 	mb.mu.Lock()
 	defer mb.mu.Unlock()
-	mb.scanErr = nil
 
 	if mb.address == "" {
 		if _, known := mb.discovered[a.address]; !known && len(packet.Buttons) > 0 {

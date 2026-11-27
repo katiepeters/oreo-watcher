@@ -78,7 +78,8 @@ func newHarness(t *testing.T, address string) *harness {
 		adverts: make(chan advert),
 	}
 	h.mb = newWithSource(sensor.Named("mode-button"), address, h.ctrl, h.speaker, logging.NewTestLogger(t))
-	h.mb.start(func(ctx context.Context, onAdvert func(advert)) error {
+	h.mb.start(func(ctx context.Context, onAdvert func(advert), onListening func()) error {
+		onListening()
 		for {
 			select {
 			case <-ctx.Done():
@@ -328,5 +329,51 @@ func TestAdvertFromBlueZProperties(t *testing.T) {
 		if _, ok := advertFrom(adapter, tc.path, tc.props); ok {
 			t.Errorf("%s: want no advert", name)
 		}
+	}
+}
+
+func TestBluetoothErrorClearsOnceListeningResumes(t *testing.T) {
+	failed := make(chan struct{})
+	resume := make(chan struct{})
+	listening := make(chan struct{})
+	attempts := 0
+	mb := newWithSource(sensor.Named("mode-button"), remoteAddr, &fakeModeCtrl{}, &fakeSpeaker{}, logging.NewTestLogger(t))
+	mb.retryDelay = time.Millisecond
+	mb.start(func(ctx context.Context, _ func(advert), onListening func()) error {
+		attempts++
+		if attempts == 1 {
+			defer close(failed)
+			return errors.New("adapter powered off")
+		}
+		<-resume
+		onListening()
+		close(listening)
+		<-ctx.Done()
+		return nil
+	})
+	t.Cleanup(func() { mb.Close(context.Background()) })
+
+	<-failed
+	waitForReading(t, mb, "bluetooth_error", "adapter powered off")
+	close(resume)
+	<-listening
+	waitForReading(t, mb, "bluetooth_error", nil)
+}
+
+func waitForReading(t *testing.T, mb *modeButton, key string, want interface{}) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		readings, err := mb.Readings(context.Background(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if readings[key] == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s = %v, want %v", key, readings[key], want)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }

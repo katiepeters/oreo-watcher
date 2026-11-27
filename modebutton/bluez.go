@@ -21,8 +21,9 @@ type advert struct {
 }
 
 // advertSource delivers BTHome adverts to onAdvert until ctx is cancelled
-// (returning nil) or listening fails.
-type advertSource func(ctx context.Context, onAdvert func(advert)) error
+// (returning nil) or listening fails. It calls onListening once adverts can
+// start arriving.
+type advertSource func(ctx context.Context, onAdvert func(advert), onListening func()) error
 
 const (
 	bluezService    = "org.bluez"
@@ -32,13 +33,16 @@ const (
 	dbusObjectMgr   = "org.freedesktop.DBus.ObjectManager"
 	sigPropsChanged = dbusProperties + ".PropertiesChanged"
 	sigIfacesAdded  = dbusObjectMgr + ".InterfacesAdded"
+	// bluezErrInProgress is what StartDiscovery returns when this client is
+	// already discovering.
+	bluezErrInProgress = "org.bluez.Error.InProgress"
 )
 
 // listenBlueZ returns an advertSource backed by BlueZ's LE discovery on the
 // named adapter (e.g. "hci0"). BlueZ doesn't expose raw advertising packets;
 // it surfaces them as changes to each device's ServiceData property.
 func listenBlueZ(adapter string) advertSource {
-	return func(ctx context.Context, onAdvert func(advert)) error {
+	return func(ctx context.Context, onAdvert func(advert), onListening func()) error {
 		conn, err := dbus.ConnectSystemBus(dbus.WithContext(ctx))
 		if err != nil {
 			return fmt.Errorf("connecting to the system D-Bus (is BlueZ installed and running?): %w", err)
@@ -80,10 +84,19 @@ func listenBlueZ(adapter string) advertSource {
 		if err := adapterObj.CallWithContext(ctx, bluezAdapter+".SetDiscoveryFilter", 0, filter).Err; err != nil {
 			return fmt.Errorf("setting BlueZ discovery filter: %w", err)
 		}
-		if err := adapterObj.CallWithContext(ctx, bluezAdapter+".StartDiscovery", 0).Err; err != nil {
+		startDiscovery := func() error {
+			err := adapterObj.CallWithContext(ctx, bluezAdapter+".StartDiscovery", 0).Err
+			var dbusErr dbus.Error
+			if errors.As(err, &dbusErr) && dbusErr.Name == bluezErrInProgress {
+				return nil
+			}
+			return err
+		}
+		if err := startDiscovery(); err != nil {
 			return fmt.Errorf("starting BlueZ discovery (is the adapter powered on?): %w", err)
 		}
 		defer adapterObj.Call(bluezAdapter+".StopDiscovery", 0)
+		onListening()
 
 		for {
 			select {
@@ -114,8 +127,13 @@ func listenBlueZ(adapter string) advertSource {
 						if sig.Path != adapterPath {
 							continue
 						}
+						// Discovery is shared by every Bluetooth client on the
+						// machine, and BlueZ turns it off when another client
+						// stops its own scan, so it has to be turned back on.
 						if discovering, ok := changes["Discovering"].Value().(bool); ok && !discovering {
-							return errors.New("BlueZ stopped discovery")
+							if err := startDiscovery(); err != nil {
+								return fmt.Errorf("restarting BlueZ discovery after it was stopped: %w", err)
+							}
 						}
 					case bluezDevice:
 						if a, ok := advertFrom(adapterPath, sig.Path, changes); ok {
