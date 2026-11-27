@@ -9,22 +9,26 @@ import (
 )
 
 // chimeNotes is the short rising two-note chime played ahead of a spoken
-// announcement. The speaker takes a moment to produce sound after being idle
-// and swallows whatever comes first; the chime takes that loss instead of the
-// first word, and tells the listener something is about to be said.
+// announcement. The speaker fades its volume up over the first sound it plays
+// after being quiet; the chime takes that fade instead of the first word.
 var chimeNotes = []struct {
 	hz  float64
 	dur time.Duration
 }{
-	{660, 140 * time.Millisecond},
-	{880, 220 * time.Millisecond},
+	{660, 160 * time.Millisecond},
+	{880, 260 * time.Millisecond},
 }
 
 const (
-	// chimeAmplitude is the chime's peak as a fraction of full scale.
-	chimeAmplitude = 0.2
-	// chimeGap is the pause between the chime and the speech.
-	chimeGap = 150 * time.Millisecond
+	// chimeAmplitude is the chime's peak as a fraction of full scale. It is
+	// near speech level on purpose: a quieter chime did not wake the speaker.
+	chimeAmplitude = 0.5
+	// chimeOvertone is the level of each note's octave overtone relative to
+	// its fundamental, which makes the chime less of a pure tone.
+	chimeOvertone = 0.3
+	// chimeGap is the pause between the chime and the speech, kept short so
+	// the speaker has no time to go quiet again.
+	chimeGap = 40 * time.Millisecond
 )
 
 // announcement returns speech (16-bit PCM) preceded by the chime, with the
@@ -47,7 +51,9 @@ func chime(info *rutils.AudioInfo) []byte {
 		frames := int(note.dur.Seconds() * rate)
 		for f := 0; f < frames; f++ {
 			envelope := math.Sin(math.Pi * float64(f) / float64(frames))
-			value := chimeAmplitude * envelope * math.Sin(2*math.Pi*note.hz*float64(f)/rate)
+			phase := 2 * math.Pi * note.hz * float64(f) / rate
+			tone := (math.Sin(phase) + chimeOvertone*math.Sin(2*phase)) / (1 + chimeOvertone)
+			value := chimeAmplitude * envelope * tone
 			sample := uint16(int16(math.Round(value * math.MaxInt16)))
 			for ch := 0; ch < channels; ch++ {
 				out = binary.LittleEndian.AppendUint16(out, sample)

@@ -26,7 +26,7 @@ func peak(s []int16) float64 {
 	return p
 }
 
-func TestChimeIsShortQuietAndClickFree(t *testing.T) {
+func TestChimeIsShortSpeechLevelAndClickFree(t *testing.T) {
 	for _, info := range []*rutils.AudioInfo{
 		{Codec: rutils.CodecPCM16, SampleRateHz: 22050, NumChannels: 1},
 		{Codec: rutils.CodecPCM16, SampleRateHz: 48000, NumChannels: 2},
@@ -36,8 +36,8 @@ func TestChimeIsShortQuietAndClickFree(t *testing.T) {
 			t.Errorf("%dHz: chime lasts %v, want between 300ms and 1s", info.SampleRateHz, d)
 		}
 		s := samples(pcm)
-		if p := peak(s); p < 0.05*math.MaxInt16 || p > 0.3*math.MaxInt16 {
-			t.Errorf("%dHz: chime peak is %.0f, want audible but well under full scale", info.SampleRateHz, p)
+		if p := peak(s); p < 0.3*math.MaxInt16 || p > 0.6*math.MaxInt16 {
+			t.Errorf("%dHz: chime peak is %.0f, want near speech level without clipping", info.SampleRateHz, p)
 		}
 		if first := math.Abs(float64(s[0])); first > 50 {
 			t.Errorf("%dHz: chime starts at %v, which would click", info.SampleRateHz, first)
