@@ -58,9 +58,11 @@ Sensor that lets a Shelly BLU RC Button 4 remote (including the ZB models, e.g. 
 | 1      | Switch to `home`, then say "Switched to home mode"            |
 | 2      | Switch to `away_lite`, then say "Switched to away lite mode"  |
 | 3      | Switch to `away`, then say "Switched to away mode"            |
-| 4      | Say "Currently in ... mode" without changing it               |
+| 4      | Cancel the bark warning in progress (see below)               |
 
 A single, double, or triple press all count as a press. Long presses and holds are ignored. The mode is only spoken once `mode-controller` has accepted and persisted it, so hearing the announcement means the switch happened. Each announcement is preceded by a short two-note chime, which keeps the speaker from swallowing the first word as it wakes up.
+
+Button 4 sends `cancel_warning` to `bark-monitor`: the sound that is playing stops, and the rest of that bark session stays silent, including its good-job sound. Bark detection, recording and the session reading carry on (the reading gets `warnings_cancelled: true`), and the next session warns as normal. Button 4 does nothing audible when no warning is in progress.
 
 The remote is heard over Bluetooth: every press is broadcast as a BTHome advertisement, which this component picks up through BlueZ. The remote needs no pairing and the machine needs no Zigbee radio, but it does need a Bluetooth adapter and BlueZ (Linux only), and the remote must be within Bluetooth range. The remote's BTHome encryption must be left off (the factory default).
 
@@ -107,7 +109,7 @@ Simulate a press, e.g. to test the announcement without the remote in hand:
 {"command": "press", "button": 3}
 ```
 
-Returns `{"mode": "away"}` after the announcement finishes, or an error if the mode could not be set or spoken.
+Buttons 1-3 return `{"mode": "away"}` after the announcement finishes, or an error if the mode could not be set or spoken. Button 4 returns `{"cancelled": true}` if there was a warning or pending good-job sound to cancel.
 
 ## Model katie-viam:oreo-watcher:inference-monitor
 

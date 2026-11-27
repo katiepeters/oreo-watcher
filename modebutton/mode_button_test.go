@@ -46,7 +46,12 @@ func (f *fakeModeCtrl) current() string {
 	return f.mode
 }
 
-// fakeSpeaker records what bark-monitor's say command was asked to speak.
+// cancelled is what fakeSpeaker reports on its spoken channel for a
+// cancel_warning command, so tests can order it against announcements.
+const cancelled = "<cancel_warning>"
+
+// fakeSpeaker stands in for bark-monitor, recording what its say command was
+// asked to speak and when cancel_warning was sent.
 type fakeSpeaker struct {
 	spoken chan string
 	volume float64 // volume of the most recent say
@@ -54,11 +59,15 @@ type fakeSpeaker struct {
 }
 
 func (f *fakeSpeaker) DoCommand(_ context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
-	if cmd["command"] != "say" {
-		return nil, errors.New("unexpected command")
-	}
 	if f.err != nil {
 		return nil, f.err
+	}
+	if cmd["command"] == "cancel_warning" {
+		f.spoken <- cancelled
+		return map[string]interface{}{"cancelled": true}, nil
+	}
+	if cmd["command"] != "say" {
+		return nil, errors.New("unexpected command")
 	}
 	f.volume = cmd["volume"].(float64)
 	f.spoken <- cmd["text"].(string)
@@ -131,10 +140,10 @@ func (h *harness) expectSpoken(t *testing.T, want string) {
 func (h *harness) expectSilence(t *testing.T, nextPacketID byte) {
 	t.Helper()
 	h.send(remoteAddr, payload(nextPacketID, 4, bthome.ButtonPress))
-	h.expectSpoken(t, "Currently in "+h.ctrl.current()+" mode")
+	h.expectSpoken(t, cancelled)
 }
 
-func TestButtonsSelectAndAnnounceModes(t *testing.T) {
+func TestButtonsSelectModesAndCancelWarnings(t *testing.T) {
 	h := newHarness(t, remoteAddr)
 	for i, tc := range []struct {
 		button   int
@@ -144,9 +153,9 @@ func TestButtonsSelectAndAnnounceModes(t *testing.T) {
 	}{
 		{3, bthome.ButtonPress, "away", "Switched to away mode"},
 		{2, bthome.ButtonPress, "away_lite", "Switched to away lite mode"},
-		{4, bthome.ButtonPress, "away_lite", "Currently in away lite mode"},
+		{4, bthome.ButtonPress, "away_lite", cancelled},
 		{1, bthome.ButtonDoublePress, "home", "Switched to home mode"},
-		{4, bthome.ButtonTriplePress, "home", "Currently in home mode"},
+		{4, bthome.ButtonTriplePress, "home", cancelled},
 	} {
 		h.send(remoteAddr, payload(byte(i), tc.button, tc.event))
 		h.expectSpoken(t, tc.wantSay)
@@ -388,11 +397,24 @@ func ptr(v float64) *float64 { return &v }
 func TestAnnouncementVolumeIsPassedToTheSpeaker(t *testing.T) {
 	h := newHarness(t, remoteAddr)
 	h.mb.volume = 0.4
-	if _, err := h.mb.DoCommand(context.Background(), map[string]interface{}{"command": "press", "button": float64(4)}); err != nil {
+	if _, err := h.mb.DoCommand(context.Background(), map[string]interface{}{"command": "press", "button": float64(2)}); err != nil {
 		t.Fatal(err)
 	}
-	h.expectSpoken(t, "Currently in home mode")
+	h.expectSpoken(t, "Switched to away lite mode")
 	if h.speaker.volume != 0.4 {
 		t.Fatalf("speaker asked for volume %v, want 0.4", h.speaker.volume)
 	}
+}
+
+func TestButtonFourCancelsWithoutTouchingTheMode(t *testing.T) {
+	h := newHarness(t, remoteAddr)
+	h.ctrl.setErr = errors.New("mode must not be set")
+	resp, err := h.mb.DoCommand(context.Background(), map[string]interface{}{"command": "press", "button": float64(4)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp["cancelled"] != true {
+		t.Fatalf("resp = %v, want cancelled", resp)
+	}
+	h.expectSpoken(t, cancelled)
 }

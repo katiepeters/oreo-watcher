@@ -27,8 +27,9 @@ var Model = resource.NewModel("katie-viam", "oreo-watcher", "mode-button")
 
 const (
 	defaultAdapter = "hci0"
-	// announceButton speaks the current mode instead of changing it.
-	announceButton    = 4
+	// cancelButton silences the bark warning in progress instead of changing
+	// the mode.
+	cancelButton      = 4
 	buttonCount       = 4
 	defaultRetryDelay = 10 * time.Second
 	// repeatWindow is how long an identical advert without a packet ID is
@@ -57,7 +58,8 @@ type Config struct {
 	MACAddress string `json:"mac_address"`
 	// ModeController is the mode-controller sensor that buttons 1-3 drive.
 	ModeController string `json:"mode_controller"`
-	// BarkMonitor is the bark-monitor sensor whose speaker announces the mode.
+	// BarkMonitor is the bark-monitor sensor: its speaker announces the mode,
+	// and button 4 cancels its bark warning.
 	BarkMonitor string `json:"bark_monitor"`
 	// Adapter is the BlueZ adapter to listen on. Defaults to "hci0".
 	Adapter string `json:"adapter"`
@@ -104,7 +106,7 @@ type modeButton struct {
 	logger     logging.Logger
 	address    string // empty until mac_address is configured
 	modeCtrl   commander
-	speaker    commander
+	barkMon    commander
 	presses    chan int
 	retryDelay time.Duration // wait before listening again after a failure
 	volume     float64       // announcement volume, (0, 1]
@@ -162,7 +164,7 @@ func newWithSource(name resource.Name, address string, modeCtrl, speaker command
 		logger:     logger,
 		address:    address,
 		modeCtrl:   modeCtrl,
-		speaker:    speaker,
+		barkMon:    speaker,
 		presses:    make(chan int, buttonCount),
 		retryDelay: defaultRetryDelay,
 		volume:     1,
@@ -272,34 +274,30 @@ func (mb *modeButton) handleAdvert(a advert) {
 	}
 }
 
-// press performs a button's action and returns the mode that was announced.
-// The mode is only spoken once the mode controller has accepted it.
-func (mb *modeButton) press(ctx context.Context, button int) (string, error) {
-	var mode, text string
-	if target, ok := buttonModes[button]; ok {
-		mode = string(target)
-		if _, err := mb.modeCtrl.DoCommand(ctx, map[string]interface{}{"command": "set_mode", "mode": mode}); err != nil {
-			return "", fmt.Errorf("setting mode %q: %w", mode, err)
-		}
-		text = "Switched to " + target.SpokenName()
-	} else if button == announceButton {
-		resp, err := mb.modeCtrl.DoCommand(ctx, map[string]interface{}{"command": "get_mode"})
+// press performs a button's action and returns its outcome: the mode that was
+// selected and announced, or whether a bark warning was cancelled. A mode is
+// only spoken once the mode controller has accepted it.
+func (mb *modeButton) press(ctx context.Context, button int) (map[string]interface{}, error) {
+	if button == cancelButton {
+		resp, err := mb.barkMon.DoCommand(ctx, map[string]interface{}{"command": "cancel_warning"})
 		if err != nil {
-			return "", fmt.Errorf("reading mode: %w", err)
+			return nil, fmt.Errorf("cancelling the bark warning: %w", err)
 		}
-		if mode, ok = resp["mode"].(string); !ok || mode == "" {
-			return "", fmt.Errorf("mode controller returned no mode: %v", resp)
-		}
-		text = "Currently in " + modecontroller.Mode(mode).SpokenName()
-	} else {
-		return "", fmt.Errorf("unknown button %d; the remote has buttons 1-%d", button, buttonCount)
+		return resp, nil
 	}
-
-	say := map[string]interface{}{"command": "say", "text": text, "volume": mb.volume}
-	if _, err := mb.speaker.DoCommand(ctx, say); err != nil {
-		return mode, fmt.Errorf("mode is %q but announcing it failed: %w", mode, err)
+	target, ok := buttonModes[button]
+	if !ok {
+		return nil, fmt.Errorf("unknown button %d; the remote has buttons 1-%d", button, buttonCount)
 	}
-	return mode, nil
+	mode := string(target)
+	if _, err := mb.modeCtrl.DoCommand(ctx, map[string]interface{}{"command": "set_mode", "mode": mode}); err != nil {
+		return nil, fmt.Errorf("setting mode %q: %w", mode, err)
+	}
+	say := map[string]interface{}{"command": "say", "text": "Switched to " + target.SpokenName(), "volume": mb.volume}
+	if _, err := mb.barkMon.DoCommand(ctx, say); err != nil {
+		return nil, fmt.Errorf("mode is %q but announcing it failed: %w", mode, err)
+	}
+	return map[string]interface{}{"mode": mode}, nil
 }
 
 // Readings reports the remote's state.
@@ -340,11 +338,7 @@ func (mb *modeButton) DoCommand(ctx context.Context, cmd map[string]interface{})
 	if !ok {
 		return nil, fmt.Errorf("press requires a numeric \"button\" (1-%d)", buttonCount)
 	}
-	mode, err := mb.press(ctx, int(button))
-	if err != nil {
-		return nil, err
-	}
-	return map[string]interface{}{"mode": mode}, nil
+	return mb.press(ctx, int(button))
 }
 
 func (mb *modeButton) Close(ctx context.Context) error {

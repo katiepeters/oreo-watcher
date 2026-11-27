@@ -38,7 +38,7 @@
     {
       "api": "rdk:component:sensor",
       "model": "katie-viam:oreo-watcher:mode-button",
-      "short_description": "Shelly BLU RC Button 4 remote: buttons 1-3 select home/away_lite/away, button 4 speaks the mode",
+      "short_description": "Shelly BLU RC Button 4 remote: buttons 1-3 select home/away_lite/away, button 4 cancels the bark warning",
       "markdown_link": "README.md#model-katie-viamoreo-watchermode-button"
     },
     {

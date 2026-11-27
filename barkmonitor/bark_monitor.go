@@ -133,6 +133,9 @@ type completedSession struct {
 	// started, so effectiveness can also be compared across parts of a clip.
 	Warn1ClipOffsetSec float64
 	Warn2ClipOffsetSec float64
+	// WarningsCancelled is true if someone cancelled the session's warnings,
+	// so its timing says nothing about how well the warning sound worked.
+	WarningsCancelled bool
 }
 
 type barkMonitor struct {
@@ -189,6 +192,10 @@ type barkMonitor struct {
 	warn1Played    bool
 	warn2Played    bool
 	classifyErrors int
+	// warningsCancelled is set by the cancel_warning command: the rest of the
+	// session (and its good-job sound) stays silent. Reset when a new session
+	// starts.
+	warningsCancelled bool
 	// sessionDogs holds the most recently detected dog name(s) for the
 	// active (or just-ended) session, used to build TTS voice lines
 	// dynamically. Not cleared on session end, so onGoodJob (which fires
@@ -536,6 +543,7 @@ func sessionReading(s *completedSession) map[string]interface{} {
 		"secs_after_last_warn": math.Round(s.SecsAfterLastWarn*10) / 10,
 		"classify_errors":      s.ClassifyErrors,
 		"warning_sound":        s.WarningSound,
+		"warnings_cancelled":   s.WarningsCancelled,
 	}
 	if s.Warn1Fired {
 		r["warn1_clip_offset_s"] = math.Round(s.Warn1ClipOffsetSec*10) / 10
@@ -635,6 +643,7 @@ func (b *barkMonitor) onBarkDetected(db float64, barkStart time.Time, detectedDo
 		b.maxDB = db
 		b.warn1Played = true
 		b.warn2Played = false
+		b.warningsCancelled = false
 		b.classifyErrors = 0
 		clip := pickWarningClip()
 		b.sessionWarnClip = clip
@@ -666,7 +675,7 @@ func (b *barkMonitor) onBarkDetected(db float64, barkStart time.Time, detectedDo
 			b.playPCM(context.Background(), w.pcm, w.info)
 			b.mu.Lock()
 			defer b.mu.Unlock()
-			if b.inSession {
+			if b.inSession && !b.warningsCancelled {
 				b.warn2Timer = time.AfterFunc(b.warnDur, b.onSecondWarn)
 			}
 		}()
@@ -698,7 +707,7 @@ func (b *barkMonitor) onSecondWarn() {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if !b.inSession {
+	if !b.inSession || b.warningsCancelled {
 		return
 	}
 	if time.Since(b.lastBarkTime) > b.gapDur/2 {
@@ -722,7 +731,7 @@ func (b *barkMonitor) onSecondWarn() {
 		b.playPCM(context.Background(), w.pcm, w.info)
 		b.mu.Lock()
 		defer b.mu.Unlock()
-		if b.inSession {
+		if b.inSession && !b.warningsCancelled {
 			b.actionTimer = time.AfterFunc(b.actionDur, b.onThirdAction)
 		}
 	}()
@@ -736,7 +745,7 @@ func (b *barkMonitor) onThirdAction() {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if !b.inSession {
+	if !b.inSession || b.warningsCancelled {
 		return
 	}
 	b.logger.Infof("bark session third-action threshold reached (%.0fs elapsed) — not yet implemented", time.Since(b.sessionStart).Seconds())
@@ -775,6 +784,7 @@ func (b *barkMonitor) onSessionEnd() {
 		WarningSound:       b.warningSound,
 		Warn1ClipOffsetSec: b.warn1ClipOffsetSec,
 		Warn2ClipOffsetSec: b.warn2ClipOffsetSec,
+		WarningsCancelled:  b.warningsCancelled,
 	}
 
 	// Stop the continuous recorder after clipPad seconds of post-roll.
@@ -788,7 +798,7 @@ func (b *barkMonitor) onSessionEnd() {
 
 	b.classifyErrors = 0
 	b.inSession = false
-	scheduleGoodJob := b.warn1Played
+	scheduleGoodJob := b.warn1Played && !b.warningsCancelled
 	startedWithCameras := b.sessionCamerasAllowed
 	b.sessionCamerasAllowed = false
 
@@ -916,6 +926,7 @@ func (b *barkMonitor) onGoodJob() {
 		b.mu.Unlock()
 		return
 	}
+	b.goodJobTimer = nil
 	goodJobCtx, goodJobCancel := context.WithCancel(context.Background())
 	b.goodJobToken++
 	myToken := b.goodJobToken
@@ -1097,6 +1108,39 @@ func (b *barkMonitor) playPCM(ctx context.Context, pcm []byte, info *rutils.Audi
 	}
 }
 
+// cancelWarning silences the current bark session: it stops whatever is
+// playing, and no further warning or good-job sound plays until a new session
+// starts. Detection and recording carry on. It reports whether there was
+// anything to cancel.
+func (b *barkMonitor) cancelWarning(ctx context.Context) bool {
+	b.mu.Lock()
+	active := b.inSession || b.goodJobTimer != nil || b.goodJobCancel != nil
+	b.warningsCancelled = true
+	for _, timer := range []*time.Timer{b.warn2Timer, b.actionTimer, b.goodJobTimer} {
+		if timer != nil {
+			timer.Stop()
+		}
+	}
+	b.goodJobTimer = nil
+	if b.goodJobCancel != nil {
+		b.goodJobCancel()
+		b.goodJobCancel = nil
+	}
+	b.mu.Unlock()
+
+	if b.speaker != nil {
+		// Cancelling the context of an in-flight Play doesn't stop audio the
+		// speaker has already buffered; its own stop command does.
+		if _, err := b.speaker.DoCommand(ctx, map[string]interface{}{"stop": true}); err != nil {
+			b.logger.Warnw("could not stop the speaker; the current sound will play out", "error", err)
+		}
+	}
+	if active {
+		b.logger.Info("bark warnings cancelled for this session")
+	}
+	return active
+}
+
 // micMuteCooldown is added after a sound's own duration when muting the mic,
 // to cover room echo/reverberation tail after playback ends.
 const micMuteCooldown = 1500 * time.Millisecond
@@ -1142,6 +1186,7 @@ func wavToPCM(wav []byte) ([]byte, *rutils.AudioInfo, error) {
 //	{"command": "play_bark_detected"} — play a random warning clip section
 //	{"command": "play_bark_detected", "sound": "bugle"} — play a section of a specific clip
 //	{"command": "play_barking_stopped"} — play the session-end line
+//	{"command": "cancel_warning"} — stop the sound that is playing and keep the rest of this bark session, including its good-job sound, silent
 //	{"command": "say", "text": "...", "volume": 0.5} — play a chime, then speak text; volume (0-1] is optional; returns once playback finishes
 func (b *barkMonitor) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
 	command, _ := cmd["command"].(string)
@@ -1169,6 +1214,8 @@ func (b *barkMonitor) DoCommand(ctx context.Context, cmd map[string]interface{})
 			b.playSound(context.Background(), sound)
 		}()
 		return map[string]interface{}{"ok": true}, nil
+	case "cancel_warning":
+		return map[string]interface{}{"cancelled": b.cancelWarning(ctx)}, nil
 	case "say":
 		text, _ := cmd["text"].(string)
 		if text == "" {
@@ -1195,7 +1242,7 @@ func (b *barkMonitor) DoCommand(ctx context.Context, cmd map[string]interface{})
 		b.playPCM(ctx, announcement(pcm, info, volume), info)
 		return map[string]interface{}{"ok": true}, nil
 	default:
-		return nil, fmt.Errorf("unknown command %q; supported: play_bark_detected, play_barking_stopped, say", command)
+		return nil, fmt.Errorf("unknown command %q; supported: play_bark_detected, play_barking_stopped, cancel_warning, say", command)
 	}
 }
 
