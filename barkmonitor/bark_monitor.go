@@ -81,13 +81,12 @@ type Config struct {
 	// a machine where storing footage is acceptable (e.g. your own).
 	StoreVideoClips bool `json:"store_video_clips"`
 
-	// Custom sounds: a configured static WAV file always takes precedence
-	// over the dynamic TTS lines — a per-dog file only applies when exactly
-	// one dog was identified (a single static clip can't represent multiple
-	// dogs barking together), then the generic default path, then TTS, then
-	// the embedded WAV as the last resort. Nothing needs to be configured —
-	// today's reality is nobody has recorded custom sounds yet, so this
-	// falls through to TTS automatically until per-user recordings exist.
+	// Custom sounds: a configured static WAV file always takes precedence — a
+	// per-dog file only applies when exactly one dog was identified (a single
+	// static clip can't represent multiple dogs barking together), then the
+	// generic default path. With nothing configured, warnings come from the
+	// rotation in warning_sounds.go and the session-end sound is the built-in
+	// "good job" recording.
 	WarningSoundPath string            `json:"warning_sound_path"`  // optional: filesystem path to default warning WAV
 	GoodJobSoundPath string            `json:"good_job_sound_path"` // optional: filesystem path to default good-job WAV
 	DogWarningSounds map[string]string `json:"dog_warning_sounds"`  // dog name -> WAV path
@@ -971,17 +970,6 @@ func barkDetectedPhrase(detectedDogs []string) string {
 	return fmt.Sprintf("%s, bark detected", name)
 }
 
-// barkingStoppedPhrase returns the TTS line spoken when a bark session ends
-// (replaces the old "good job" phrasing), naming whichever dog(s) were
-// detected during that session.
-func barkingStoppedPhrase(detectedDogs []string) string {
-	name := joinDogNames(detectedDogs)
-	if name == "" {
-		return "Barking stopped"
-	}
-	return fmt.Sprintf("%s, barking stopped", name)
-}
-
 // synthesizeOrFallback attempts TTS synthesis of text, logging a warning and
 // returning fallback if it fails (e.g. espeak/espeak-ng not installed).
 func (b *barkMonitor) synthesizeOrFallback(text string, fallback []byte) []byte {
@@ -1052,7 +1040,10 @@ func (b *barkMonitor) prepareWarning(detectedDogs []string, clip warningClip) pr
 	return preparedWarning{pcm: pcm, info: info, label: "fallback"}
 }
 
-// goodJobSoundFor is warnSoundFor's counterpart for the session-end sound.
+// goodJobSoundFor resolves the session-end sound: a configured per-dog file
+// (only when exactly one dog was identified), then the configured default
+// file, then the built-in "good job" recording. It is always a recording,
+// never synthesized speech: the dog is trained on that specific sound.
 func (b *barkMonitor) goodJobSoundFor(detectedDogs []string) []byte {
 	if len(detectedDogs) == 1 {
 		if snd, ok := b.dogGoodJobSounds[detectedDogs[0]]; ok {
@@ -1062,7 +1053,7 @@ func (b *barkMonitor) goodJobSoundFor(detectedDogs []string) []byte {
 	if b.defaultGoodJobSound != nil {
 		return b.defaultGoodJobSound
 	}
-	return b.synthesizeOrFallback(barkingStoppedPhrase(detectedDogs), goodJobSound)
+	return goodJobSound
 }
 
 // playSound plays WAV bytes via the configured speaker component. Blocks until playback completes.

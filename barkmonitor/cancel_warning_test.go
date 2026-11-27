@@ -1,6 +1,7 @@
 package barkmonitor
 
 import (
+	"bytes"
 	"context"
 	"sync/atomic"
 	"testing"
@@ -156,5 +157,20 @@ func TestNextSessionWarnsAgainAfterACancel(t *testing.T) {
 			t.Fatalf("next session played %d sounds, want its warning and good-job sound", speaker.plays.Load()-before)
 		}
 		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// A working TTS engine must not replace the recorded good-job sound.
+func TestGoodJobIsTheRecordingEvenWhenSpeechIsAvailable(t *testing.T) {
+	installFakePiper(t, fakePiper)
+	b := &barkMonitor{logger: logging.NewTestLogger(t)}
+	if got := b.goodJobSoundFor([]string{"oreo"}); !bytes.Equal(got, goodJobSound) {
+		t.Error("good-job sound is not the built-in recording")
+	}
+
+	custom := []byte("custom recording")
+	b.defaultGoodJobSound = custom
+	if got := b.goodJobSoundFor([]string{"oreo"}); !bytes.Equal(got, custom) {
+		t.Error("configured good_job_sound_path recording was not used")
 	}
 }
