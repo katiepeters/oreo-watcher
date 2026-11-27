@@ -990,6 +990,10 @@ func ttsBinary() (string, error) {
 // default of 175 so short phrases are easier to catch.
 const ttsWordsPerMinute = "150"
 
+// ttsVoice is the espeak voice: US English with the "f3" variant, which is
+// higher and softer than the flat default.
+const ttsVoice = "en-us+f3"
+
 // synthesizeSpeech renders text to WAV bytes using the device's espeak/espeak-ng
 // binary (installed by first_run.sh). Requires one to be present.
 func synthesizeSpeech(text string) ([]byte, error) {
@@ -1006,7 +1010,7 @@ func synthesizeSpeech(text string) ([]byte, error) {
 	tmpFile.Close()
 	defer os.Remove(tmpPath)
 
-	cmd := exec.Command(bin, "-s", ttsWordsPerMinute, "-w", tmpPath, text)
+	cmd := exec.Command(bin, "-v", ttsVoice, "-s", ttsWordsPerMinute, "-w", tmpPath, text)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("%s: %w\n%s", bin, err, out)
 	}
@@ -1116,19 +1120,34 @@ func (b *barkMonitor) playSound(ctx context.Context, wav []byte) {
 	b.playPCM(ctx, withLeadIn(pcm, info, playbackLeadIn), info)
 }
 
-// playbackLeadIn is silence played ahead of a sound. The speaker takes a moment
-// to start producing audio after being idle, which otherwise swallows the
-// first syllable of a spoken line.
-const playbackLeadIn = 300 * time.Millisecond
+// playbackLeadIn is how long a near-silent signal plays ahead of a sound. The
+// speaker takes a moment to start producing audio after being idle, which
+// otherwise swallows the first syllable of a spoken line.
+const playbackLeadIn = 500 * time.Millisecond
 
-// withLeadIn returns pcm (16-bit samples) preceded by dur of silence.
+// leadInAmplitude is the sample value of the lead-in signal, about 72dB below
+// full scale. It is inaudible, but unlike digital silence it keeps a speaker
+// that sleeps on silence awake.
+const leadInAmplitude = 8
+
+// withLeadIn returns pcm (16-bit samples) preceded by dur of lead-in signal.
 func withLeadIn(pcm []byte, info *rutils.AudioInfo, dur time.Duration) []byte {
 	if info == nil || info.SampleRateHz <= 0 || info.NumChannels <= 0 {
 		return pcm
 	}
 	frames := int(dur * time.Duration(info.SampleRateHz) / time.Second)
-	silence := make([]byte, frames*int(info.NumChannels)*2)
-	return append(silence, pcm...)
+	channels := int(info.NumChannels)
+	out := make([]byte, frames*channels*2, frames*channels*2+len(pcm))
+	for frame := 0; frame < frames; frame++ {
+		sample := int16(leadInAmplitude)
+		if frame%2 == 1 {
+			sample = -leadInAmplitude
+		}
+		for ch := 0; ch < channels; ch++ {
+			binary.LittleEndian.PutUint16(out[(frame*channels+ch)*2:], uint16(sample))
+		}
+	}
+	return append(out, pcm...)
 }
 
 // playPCM plays raw PCM via the configured speaker component. Blocks until playback completes.
