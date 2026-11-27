@@ -986,6 +986,10 @@ func ttsBinary() (string, error) {
 	return "", fmt.Errorf("neither espeak-ng nor espeak found in PATH")
 }
 
+// ttsWordsPerMinute is the speaking rate passed to espeak, a little under its
+// default of 175 so short phrases are easier to catch.
+const ttsWordsPerMinute = "150"
+
 // synthesizeSpeech renders text to WAV bytes using the device's espeak/espeak-ng
 // binary (installed by first_run.sh). Requires one to be present.
 func synthesizeSpeech(text string) ([]byte, error) {
@@ -1002,7 +1006,7 @@ func synthesizeSpeech(text string) ([]byte, error) {
 	tmpFile.Close()
 	defer os.Remove(tmpPath)
 
-	cmd := exec.Command(bin, "-w", tmpPath, text)
+	cmd := exec.Command(bin, "-s", ttsWordsPerMinute, "-w", tmpPath, text)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("%s: %w\n%s", bin, err, out)
 	}
@@ -1109,7 +1113,22 @@ func (b *barkMonitor) playSound(ctx context.Context, wav []byte) {
 		b.logger.Warnw("failed to parse WAV for playback", "error", err)
 		return
 	}
-	b.playPCM(ctx, pcm, info)
+	b.playPCM(ctx, withLeadIn(pcm, info, playbackLeadIn), info)
+}
+
+// playbackLeadIn is silence played ahead of a sound. The speaker takes a moment
+// to start producing audio after being idle, which otherwise swallows the
+// first syllable of a spoken line.
+const playbackLeadIn = 300 * time.Millisecond
+
+// withLeadIn returns pcm (16-bit samples) preceded by dur of silence.
+func withLeadIn(pcm []byte, info *rutils.AudioInfo, dur time.Duration) []byte {
+	if info == nil || info.SampleRateHz <= 0 || info.NumChannels <= 0 {
+		return pcm
+	}
+	frames := int(dur * time.Duration(info.SampleRateHz) / time.Second)
+	silence := make([]byte, frames*int(info.NumChannels)*2)
+	return append(silence, pcm...)
 }
 
 // playPCM plays raw PCM via the configured speaker component. Blocks until playback completes.
