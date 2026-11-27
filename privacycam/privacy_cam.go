@@ -35,6 +35,10 @@ var ErrCameraOff = errors.New("camera is off: cameras are only enabled in away m
 // leaves away.
 const modePollInterval = time.Second
 
+// offWaitCap bounds how long a caller without a deadline waits for cameras
+// to be allowed before getting ErrCameraOff.
+const offWaitCap = 5 * time.Minute
+
 func init() {
 	resource.RegisterComponent(camera.API, Model, resource.Registration[camera.Camera, *Config]{
 		Constructor: newPrivacyCam,
@@ -66,8 +70,10 @@ type privacyCam struct {
 	dev     camera.Camera // nil while the device is closed
 	lastErr string        // last open error logged, to avoid repeating it every poll
 
-	cancel context.CancelFunc
-	done   chan struct{}
+	offWait time.Duration
+	closing <-chan struct{}
+	cancel  context.CancelFunc
+	done    chan struct{}
 }
 
 func newPrivacyCam(ctx context.Context, deps resource.Dependencies, conf resource.Config, logger logging.Logger) (camera.Camera, error) {
@@ -94,6 +100,8 @@ func newWithDeps(named resource.Named, logger logging.Logger, open opener, allow
 		logger:  logger,
 		open:    open,
 		allowed: allowed,
+		offWait: offWaitCap,
+		closing: ctx.Done(),
 		cancel:  cancel,
 		done:    make(chan struct{}),
 	}
@@ -159,21 +167,53 @@ func (c *privacyCam) device(ctx context.Context) (camera.Camera, error) {
 		c.mu.Lock()
 		c.closeDeviceLocked(ctx)
 		c.mu.Unlock()
-		return nil, ErrCameraOff
+		if !c.waitUntilAllowed(ctx) {
+			return nil, ErrCameraOff
+		}
 	}
+	c.sync(ctx)
 	c.mu.Lock()
 	dev := c.dev
 	c.mu.Unlock()
-	if dev == nil {
-		c.sync(ctx)
-		c.mu.Lock()
-		dev = c.dev
-		c.mu.Unlock()
+	if dev != nil {
+		return dev, nil
 	}
-	if dev == nil {
-		return nil, fmt.Errorf("camera device not available (last error: %s)", c.lastErrSnapshot())
+	if !c.allowed() {
+		return nil, ErrCameraOff
 	}
-	return dev, nil
+	return nil, fmt.Errorf("camera device not available (last error: %s)", c.lastErrSnapshot())
+}
+
+// waitUntilAllowed holds callers that have no deadline, such as video-store's
+// background frame poller, until cameras are allowed. Failing those callers
+// at once makes them retry and log a warning every second for as long as the
+// mode denies cameras. Callers with a deadline (the Viam app, the CLI, vision
+// services) are not held and get ErrCameraOff immediately.
+//
+// It returns true once cameras are allowed, and false when the caller's
+// context ends, the component closes, or offWait passes.
+func (c *privacyCam) waitUntilAllowed(ctx context.Context) bool {
+	if _, hasDeadline := ctx.Deadline(); hasDeadline {
+		return false
+	}
+	timeout := time.NewTimer(c.offWait)
+	defer timeout.Stop()
+	tick := time.NewTicker(modePollInterval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-c.closing:
+			return false
+		case <-timeout.C:
+			return false
+		case <-tick.C:
+			if c.allowed() {
+				return true
+			}
+		}
+	}
 }
 
 func (c *privacyCam) lastErrSnapshot() string {

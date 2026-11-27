@@ -19,9 +19,9 @@ var Model = resource.NewModel("katie-viam", "oreo-watcher", "mode-controller")
 type Mode string
 
 const (
-	ModeAway     Mode = modestate.OperatingModeAway     // cameras + mic, data captured
-	ModeAwayLite Mode = modestate.OperatingModeAwayLite // mic only, data captured
-	ModeHome     Mode = modestate.OperatingModeHome     // bark warnings only, no data captured
+	ModeAway     Mode = modestate.OperatingModeAway     // cameras on; camera and audio data captured
+	ModeAwayLite Mode = modestate.OperatingModeAwayLite // cameras off; audio data still captured
+	ModeHome     Mode = modestate.OperatingModeHome     // cameras off; bark warnings, audio and spectrograms still captured
 )
 
 // ModeController is the interface activity-monitor and bark-monitor use to

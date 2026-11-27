@@ -58,6 +58,15 @@ func (f *fakeDevice) isOpen() bool {
 	return f.open
 }
 
+// withDeadline returns a context like the ones gRPC callers (the Viam app,
+// the CLI, vision services) send, which privacy-cam never holds.
+func withDeadline(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	t.Cleanup(cancel)
+	return ctx
+}
+
 func newTestCam(t *testing.T, dev *fakeDevice, allowed *atomic.Bool) *privacyCam {
 	t.Helper()
 	c := newWithDeps(resource.NewName(camera.API, "cam").AsNamed(), logging.NewTestLogger(t), dev.opener(), allowed.Load)
@@ -73,10 +82,10 @@ func TestNoDeviceOrFramesOutsideAway(t *testing.T) {
 	if dev.isOpen() {
 		t.Fatal("device opened at construction while cameras are denied")
 	}
-	if _, _, err := c.Images(context.Background(), nil, nil); !errors.Is(err, ErrCameraOff) {
+	if _, _, err := c.Images(withDeadline(t), nil, nil); !errors.Is(err, ErrCameraOff) {
 		t.Fatalf("Images outside away: err = %v, want ErrCameraOff", err)
 	}
-	if _, err := c.NextPointCloud(context.Background(), nil); !errors.Is(err, ErrCameraOff) {
+	if _, err := c.NextPointCloud(withDeadline(t), nil); !errors.Is(err, ErrCameraOff) {
 		t.Fatalf("NextPointCloud outside away: err = %v, want ErrCameraOff", err)
 	}
 	if dev.opens != 0 {
@@ -109,7 +118,7 @@ func TestLeavingAwayClosesDevice(t *testing.T) {
 		c := newTestCam(t, dev, &allowed)
 
 		allowed.Store(false)
-		if _, _, err := c.Images(context.Background(), nil, nil); !errors.Is(err, ErrCameraOff) {
+		if _, _, err := c.Images(withDeadline(t), nil, nil); !errors.Is(err, ErrCameraOff) {
 			t.Fatalf("Images right after leaving away: err = %v, want ErrCameraOff", err)
 		}
 		if dev.isOpen() {
@@ -181,4 +190,92 @@ func TestPropertiesDoesNotOpenDevice(t *testing.T) {
 	if dev.opens != 0 {
 		t.Fatal("Properties opened the device while cameras were denied")
 	}
+}
+
+// TestCallerWithDeadlineFailsFast keeps the Viam app and CLI responsive: a
+// caller with a deadline is never held while cameras are off.
+func TestCallerWithDeadlineFailsFast(t *testing.T) {
+	var allowed atomic.Bool
+	c := newTestCam(t, &fakeDevice{}, &allowed)
+
+	start := time.Now()
+	if _, _, err := c.Images(withDeadline(t), nil, nil); !errors.Is(err, ErrCameraOff) {
+		t.Fatalf("err = %v, want ErrCameraOff", err)
+	}
+	if waited := time.Since(start); waited > modePollInterval/2 {
+		t.Fatalf("caller with a deadline was held for %v", waited)
+	}
+}
+
+// TestCallerWithoutDeadlineWaitsForAway covers video-store's frame poller:
+// it is held while cameras are off, so it does not retry and log every
+// second, and gets a frame once the mode allows cameras.
+func TestCallerWithoutDeadlineWaitsForAway(t *testing.T) {
+	var allowed atomic.Bool
+	dev := &fakeDevice{}
+	c := newTestCam(t, dev, &allowed)
+
+	type result struct {
+		n   int
+		err error
+	}
+	got := make(chan result, 1)
+	go func() {
+		imgs, _, err := c.Images(context.Background(), nil, nil)
+		got <- result{len(imgs), err}
+	}()
+
+	select {
+	case r := <-got:
+		t.Fatalf("caller without a deadline returned while cameras were off: %+v", r)
+	case <-time.After(2 * modePollInterval):
+	}
+	if dev.isOpen() {
+		t.Fatal("device opened while the caller was waiting and cameras were off")
+	}
+
+	allowed.Store(true)
+	select {
+	case r := <-got:
+		if r.err != nil || r.n != 1 {
+			t.Fatalf("after entering away: %d images, err %v", r.n, r.err)
+		}
+	case <-time.After(3 * modePollInterval):
+		t.Fatal("waiting caller not released after entering away")
+	}
+}
+
+func TestWaitingCallerReleased(t *testing.T) {
+	t.Run("by offWait", func(t *testing.T) {
+		var allowed atomic.Bool
+		c := newTestCam(t, &fakeDevice{}, &allowed)
+		c.offWait = 50 * time.Millisecond
+		if _, _, err := c.Images(context.Background(), nil, nil); !errors.Is(err, ErrCameraOff) {
+			t.Fatalf("err = %v, want ErrCameraOff after offWait", err)
+		}
+	})
+	t.Run("by caller cancel", func(t *testing.T) {
+		var allowed atomic.Bool
+		c := newTestCam(t, &fakeDevice{}, &allowed)
+		ctx, cancel := context.WithCancel(context.Background())
+		time.AfterFunc(50*time.Millisecond, cancel)
+		if _, _, err := c.Images(ctx, nil, nil); !errors.Is(err, ErrCameraOff) {
+			t.Fatalf("err = %v, want ErrCameraOff after cancel", err)
+		}
+	})
+	t.Run("by Close", func(t *testing.T) {
+		var allowed atomic.Bool
+		c := newWithDeps(resource.NewName(camera.API, "cam").AsNamed(), logging.NewTestLogger(t), (&fakeDevice{}).opener(), allowed.Load)
+		time.AfterFunc(50*time.Millisecond, func() { _ = c.Close(context.Background()) })
+		done := make(chan error, 1)
+		go func() { _, _, err := c.Images(context.Background(), nil, nil); done <- err }()
+		select {
+		case err := <-done:
+			if !errors.Is(err, ErrCameraOff) {
+				t.Fatalf("err = %v, want ErrCameraOff after Close", err)
+			}
+		case <-time.After(3 * modePollInterval):
+			t.Fatal("Close did not release a waiting caller")
+		}
+	})
 }
