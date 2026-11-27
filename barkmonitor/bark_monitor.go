@@ -167,8 +167,8 @@ type barkMonitor struct {
 	partID     string
 
 	// Static sounds loaded once at construction from configured filesystem
-	// paths, if any. nil/empty when not configured — see warnSoundFor and
-	// goodJobSoundFor for how these combine with dynamic TTS.
+	// paths, if any. nil/empty when not configured — see prepareWarning
+	// and goodJobSoundFor for how these combine with the built-in sounds.
 	defaultWarnSound    []byte
 	defaultGoodJobSound []byte
 	dogWarnSounds       map[string][]byte
@@ -196,9 +196,9 @@ type barkMonitor struct {
 	// starts.
 	warningsCancelled bool
 	// sessionDogs holds the most recently detected dog name(s) for the
-	// active (or just-ended) session, used to build TTS voice lines
-	// dynamically. Not cleared on session end, so onGoodJob (which fires
-	// shortly after) still has the right names to speak.
+	// active (or just-ended) session, used to pick per-dog sounds. Not
+	// cleared on session end, so onGoodJob (which fires shortly after) still
+	// picks the right dog's sound.
 	sessionDogs []string
 	// sessionWarnClip is the rotation clip picked at session start; both
 	// warnings in the session play a section of it. warningSound and the
@@ -335,14 +335,14 @@ func newBarkMonitor(ctx context.Context, deps resource.Dependencies, conf resour
 		}
 	}
 
-	// Static sounds are optional — nothing configured just means the
-	// combined warnSoundFor/goodJobSoundFor lookup falls through to TTS.
+	// Static sounds are optional — nothing configured just means
+	// prepareWarning/goodJobSoundFor use the built-in sounds.
 	// A configured path that fails to load is a soft failure (logged, not
 	// fatal), same reasoning as the dataClient setup above.
 	var defaultWarnSound, defaultGoodJobSound []byte
 	if cfg.WarningSoundPath != "" {
 		if snd, err := loadSound(cfg.WarningSoundPath, nil); err != nil {
-			logger.Warnw("failed to load warning_sound_path, will fall back to TTS/embedded default",
+			logger.Warnw("failed to load warning_sound_path, will fall back to the built-in sound",
 				"path", cfg.WarningSoundPath, "error", err)
 		} else {
 			defaultWarnSound = snd
@@ -350,7 +350,7 @@ func newBarkMonitor(ctx context.Context, deps resource.Dependencies, conf resour
 	}
 	if cfg.GoodJobSoundPath != "" {
 		if snd, err := loadSound(cfg.GoodJobSoundPath, nil); err != nil {
-			logger.Warnw("failed to load good_job_sound_path, will fall back to TTS/embedded default",
+			logger.Warnw("failed to load good_job_sound_path, will fall back to the built-in sound",
 				"path", cfg.GoodJobSoundPath, "error", err)
 		} else {
 			defaultGoodJobSound = snd
@@ -360,7 +360,7 @@ func newBarkMonitor(ctx context.Context, deps resource.Dependencies, conf resour
 	for dog, path := range cfg.DogWarningSounds {
 		snd, err := loadSound(path, nil)
 		if err != nil {
-			logger.Warnw("failed to load dog_warning_sounds entry, will fall back to default/TTS", "dog", dog, "path", path, "error", err)
+			logger.Warnw("failed to load dog_warning_sounds entry, will fall back to the default sound", "dog", dog, "path", path, "error", err)
 			continue
 		}
 		dogWarnSounds[dog] = snd
@@ -369,7 +369,7 @@ func newBarkMonitor(ctx context.Context, deps resource.Dependencies, conf resour
 	for dog, path := range cfg.DogGoodJobSounds {
 		snd, err := loadSound(path, nil)
 		if err != nil {
-			logger.Warnw("failed to load dog_good_job_sounds entry, will fall back to default/TTS", "dog", dog, "path", path, "error", err)
+			logger.Warnw("failed to load dog_good_job_sounds entry, will fall back to the default sound", "dog", dog, "path", path, "error", err)
 			continue
 		}
 		dogGoodJobSounds[dog] = snd
@@ -947,40 +947,6 @@ func (b *barkMonitor) onGoodJob() {
 	}()
 }
 
-// joinDogNames joins detected dog names naturally: "Rex", "Rex and Bella",
-// or "Rex, Bella and Max". Returns "" if dogs is empty.
-func joinDogNames(dogs []string) string {
-	switch len(dogs) {
-	case 0:
-		return ""
-	case 1:
-		return dogs[0]
-	default:
-		return strings.Join(dogs[:len(dogs)-1], ", ") + " and " + dogs[len(dogs)-1]
-	}
-}
-
-// barkDetectedPhrase returns the TTS line spoken when a bark session starts,
-// naming whichever dog(s) the classifier actually detected.
-func barkDetectedPhrase(detectedDogs []string) string {
-	name := joinDogNames(detectedDogs)
-	if name == "" {
-		return "Bark detected"
-	}
-	return fmt.Sprintf("%s, bark detected", name)
-}
-
-// synthesizeOrFallback attempts TTS synthesis of text, logging a warning and
-// returning fallback if it fails (e.g. espeak/espeak-ng not installed).
-func (b *barkMonitor) synthesizeOrFallback(text string, fallback []byte) []byte {
-	sound, err := synthesizeSpeech(text)
-	if err != nil {
-		b.logger.Warnw("TTS synthesis failed, falling back to static sound", "text", text, "error", err)
-		return fallback
-	}
-	return sound
-}
-
 // preparedWarning is a decoded warning ready to play, plus what to record
 // about it in the session reading.
 type preparedWarning struct {
@@ -994,9 +960,8 @@ type preparedWarning struct {
 // Preference order: a configured per-dog static file (only when exactly one
 // dog was identified — a single static clip can't represent multiple dogs
 // barking together), then a configured generic default file, then the
-// session's rotation clip (a random section of an MP3, or the spoken
-// "<dog>, bark detected" line), then a "fallback" of TTS / the embedded WAV
-// if the rotation clip couldn't be produced.
+// session's rotation clip, then a "fallback" of the built-in "leave it"
+// recording if the rotation clip couldn't be decoded.
 func (b *barkMonitor) prepareWarning(detectedDogs []string, clip warningClip) preparedWarning {
 	var custom []byte
 	if len(detectedDogs) == 1 {
@@ -1014,16 +979,12 @@ func (b *barkMonitor) prepareWarning(detectedDogs []string, clip warningClip) pr
 	}
 
 	switch {
-	case clip.tts:
-		wav, err := synthesizeSpeech(barkDetectedPhrase(detectedDogs))
+	case clip.wav != nil:
+		pcm, info, err := wavToPCM(clip.wav)
 		if err == nil {
-			var pcm []byte
-			var info *rutils.AudioInfo
-			if pcm, info, err = wavToPCM(wav); err == nil {
-				return preparedWarning{pcm: pcm, info: info, label: clip.name}
-			}
+			return preparedWarning{pcm: pcm, info: info, label: clip.name}
 		}
-		b.logger.Warnw("failed to synthesize warning voice line, using fallback", "clip", clip.name, "error", err)
+		b.logger.Warnw("failed to parse warning clip, using fallback", "clip", clip.name, "error", err)
 	case clip.mp3 != nil:
 		pcm, info, offset, err := clip.segment(maxWarningClipDur)
 		if err == nil {
@@ -1032,8 +993,7 @@ func (b *barkMonitor) prepareWarning(detectedDogs []string, clip warningClip) pr
 		b.logger.Warnw("failed to decode warning clip, using fallback", "clip", clip.name, "error", err)
 	}
 
-	wav := b.synthesizeOrFallback(barkDetectedPhrase(detectedDogs), leaveItSound)
-	pcm, info, err := wavToPCM(wav)
+	pcm, info, err := wavToPCM(leaveItSound)
 	if err != nil {
 		b.logger.Warnw("failed to parse fallback warning WAV", "error", err)
 	}

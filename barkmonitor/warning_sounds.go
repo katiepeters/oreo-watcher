@@ -24,13 +24,15 @@ var warningWhistleMP3 []byte
 
 // warningClip is one sound in the warning rotation. name is what gets
 // recorded in the session reading (warning_sound), so it should stay stable
-// once data has been collected under it. Exactly one of mp3 or tts is set.
+// once data has been collected under it. Exactly one of mp3 or wav is set.
+// Every clip is a recording, never synthesized speech: the comparison between
+// clips only means something if each one sounds the same every time.
 type warningClip struct {
 	name string
-	mp3  []byte
-	// tts marks the spoken "<dog>, bark detected" line (the original
-	// warning), synthesized per play since it names the detected dog(s).
-	tts bool
+	// mp3 is a long clip; each play uses a random section of it.
+	mp3 []byte
+	// wav is a short recording played whole.
+	wav []byte
 }
 
 // warningClips is the rotation a bark session picks its warning sound from.
@@ -40,7 +42,7 @@ var warningClips = []warningClip{
 	{name: "tinnitus", mp3: warningTinnitusMP3},
 	{name: "bugle", mp3: warningBugleMP3},
 	{name: "whistle", mp3: warningWhistleMP3},
-	{name: "voice", tts: true},
+	{name: "leave_it", wav: leaveItSound},
 }
 
 // maxWarningClipDur caps how long any one warning plays. Clips longer than
