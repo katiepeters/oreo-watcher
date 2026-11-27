@@ -44,7 +44,7 @@ func init() {
 // Config takes the same attributes as rdk:builtin:webcam, so an existing
 // webcam component can be switched over by changing only its model.
 type Config struct {
-	videosource.WebcamConfig
+	videosource.WebcamConfig `json:",squash"`
 }
 
 // Validate checks the embedded webcam config.
